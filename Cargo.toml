@@ -5,6 +5,7 @@ members = [
     "crates/stemma-platform-windows",
     "crates/stemma-ipc",
     "apps/stemma-engine",
+    "apps/stemma-gui/src-tauri",
     "tests/e2e",
 ]
 

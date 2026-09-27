@@ -82,27 +82,44 @@ fn run(
     let logs = data.join("logs");
     security::secure_directory(&logs)?;
     let writer = RollingLog::open(&logs.join("engine.log"))?;
-    tracing_subscriber::fmt()
+    let from_env = std::env::var_os("STEMMA_LOG").is_some();
+    let builder = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(Mutex::new(writer))
         .with_env_filter(
             EnvFilter::try_from_env("STEMMA_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_filter_reloading();
+    let filter = builder.reload_handle();
+    builder
         .try_init()
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    // The configured level applies at run time unless STEMMA_LOG overrides it.
+    let set_level = move |config: &Config| {
+        if !from_env {
+            let _ = filter.reload(EnvFilter::new(config.log_level.as_str()));
+        }
+    };
     // A crash may have left the system's DNS pointing at the forwarder.
     if let Err(err) = super::restore_dns(&data) {
         tracing::error!("{err:#}");
     }
     let state = data.clone();
-    let controller = Controller::start(data.join("config.json"), move |config| {
-        if !allow_clew && stemma_platform_windows::clew_is_running() {
-            bail!("Clew is running; exit it before engaging the Stemma service");
-        }
-        super::start(config, Some(&divert), &state)
-    })?;
+    let controller = Controller::start(
+        data.join("config.json"),
+        move |config| {
+            if !allow_clew && stemma_platform_windows::clew_is_running() {
+                bail!("Clew is running; exit it before engaging the Stemma service");
+            }
+            super::start(config, Some(&divert), &state)
+        },
+        set_level,
+    )?;
     let client = controller.client();
-    let handler: ipc::Handler = Arc::new(move |request| client.call(request));
+    let handler: ipc::Handler = Arc::new(move |request| match request {
+        Request::TestProxy { group } => stemma_engine::host::test_proxy(&client, group),
+        request => client.call(request),
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

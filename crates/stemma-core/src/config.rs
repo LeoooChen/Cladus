@@ -65,6 +65,8 @@ pub struct ProxyGroup {
     pub username: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub password: String,
+    /// Reached through the proxy to measure its latency.
+    pub test_url: String,
 }
 
 impl Default for ProxyGroup {
@@ -76,6 +78,7 @@ impl Default for ProxyGroup {
             port: 7890,
             username: String::new(),
             password: String::new(),
+            test_url: "https://www.google.com".to_owned(),
         }
     }
 }

@@ -31,9 +31,17 @@ pub enum Request {
         config: Box<Config>,
     },
     Processes,
+    /// Image path and command line of a running process.
+    ProcessDetail {
+        process: ProcessKey,
+    },
     SetManual {
         process: ProcessKey,
         group: Option<GroupId>,
+    },
+    /// Measures a proxy group's latency to its test URL.
+    TestProxy {
+        group: GroupId,
     },
     SetExcluded {
         process: ProcessKey,
@@ -49,6 +57,12 @@ pub struct Status {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProcessDetail {
+    pub image_path: Option<String>,
+    pub cmdline: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Response {
@@ -57,6 +71,8 @@ pub enum Response {
     Status(Status),
     Config(Box<Config>),
     Processes(Vec<ProcessView>),
+    ProcessDetail(ProcessDetail),
+    ProxyTest { latency_ms: u64 },
     Error { message: String },
 }
 

@@ -117,6 +117,49 @@ pub async fn relay(
     )
 }
 
+/// Time until the proxy has connected to the host of `url`: the latency a
+/// new proxied connection would see.
+pub async fn probe(proxy: &ProxyEndpoint, url: &str) -> Result<Duration, String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let default_port = if url.starts_with("http://") { 80 } else { 443 };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(']') || authority.starts_with('[') => {
+            match port.parse() {
+                Ok(port) => (host, port),
+                Err(_) => (authority, default_port),
+            }
+        }
+        _ => (authority, default_port),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err(format!("invalid test URL `{url}`"));
+    }
+    let target = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("cannot resolve {host}: {err}"))?
+        .next()
+        .ok_or_else(|| format!("{host} has no address"))?;
+    let started = std::time::Instant::now();
+    let name = format!("{}:{}", proxy.host, proxy.port);
+    let mut stream = timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((proxy.host.as_str(), proxy.port)),
+    )
+    .await
+    .map_err(|_| format!("proxy {name} did not answer in time"))?
+    .map_err(|err| format!("cannot reach proxy {name}: {err}"))?;
+    timeout(
+        HANDSHAKE_TIMEOUT,
+        socks5::connect(&mut stream, target, proxy.credentials.as_ref()),
+    )
+    .await
+    .map_err(|_| format!("{host}:{port} was not reached in time"))?
+    .map_err(|err| err.to_string())?;
+    Ok(started.elapsed())
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

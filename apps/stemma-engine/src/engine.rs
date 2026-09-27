@@ -269,6 +269,15 @@ impl Engine {
         self.core.lock_background().snapshot()
     }
 
+    /// `None` once `process` has exited.
+    pub fn process_detail(&self, process: ProcessKey) -> Option<(Option<String>, Option<String>)> {
+        let inspector = self.core.inspector.as_ref();
+        if inspector.live_key(process.pid) != Some(process) {
+            return None;
+        }
+        Some((inspector.image_path(process), inspector.cmdline(process)))
+    }
+
     /// Call only with a validated configuration.
     pub fn reconfigure(&mut self, config: &Config) -> anyhow::Result<()> {
         let mut core = self.core.lock_urgent();

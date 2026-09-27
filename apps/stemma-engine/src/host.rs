@@ -41,9 +41,11 @@ pub struct Controller {
 }
 
 impl Controller {
+    /// `applied` sees the configuration at startup and after every change.
     pub fn start(
         path: PathBuf,
         factory: impl Fn(&Config) -> anyhow::Result<Engine> + Send + 'static,
+        applied: impl Fn(&Config) + Send + 'static,
     ) -> anyhow::Result<Self> {
         let config = match fs::read_to_string(&path) {
             Ok(text) => Config::from_json(&text)?,
@@ -54,6 +56,7 @@ impl Controller {
             }
             Err(err) => return Err(err.into()),
         };
+        applied(&config);
         let (tx, rx) = mpsc::sync_channel(64);
         let thread = std::thread::Builder::new()
             .name("stemma-control".into())
@@ -62,6 +65,7 @@ impl Controller {
                     config,
                     path,
                     factory: Box::new(factory),
+                    applied: Box::new(applied),
                     engine: None,
                     counters: BTreeMap::new(),
                     last_error: None,
@@ -102,6 +106,7 @@ struct State {
     config: Config,
     path: PathBuf,
     factory: Factory,
+    applied: Box<dyn Fn(&Config) + Send>,
     engine: Option<Engine>,
     counters: BTreeMap<String, u64>,
     last_error: Option<String>,
@@ -157,6 +162,7 @@ impl State {
                     engine.reconfigure(&config)?;
                 }
                 save_config(&self.path, &config)?;
+                (self.applied)(&config);
                 self.config = *config;
                 self.last_error = None;
                 Response::Ok
@@ -167,6 +173,18 @@ impl State {
                     .map(Engine::processes)
                     .unwrap_or_default(),
             ),
+            // Served by `test_proxy` without holding up the control thread.
+            Request::TestProxy { .. } => Response::error("unsupported here"),
+            Request::ProcessDetail { process } => {
+                let engine = self.engine.as_ref().context("engine is not engaged")?;
+                let (image_path, cmdline) = engine
+                    .process_detail(process)
+                    .context("process exited or its PID was reused")?;
+                Response::ProcessDetail(stemma_ipc::ProcessDetail {
+                    image_path,
+                    cmdline,
+                })
+            }
             Request::SetManual { process, group } => {
                 if group.is_some_and(|id| self.config.group(id).is_none()) {
                     bail!("unknown proxy group");
@@ -200,6 +218,29 @@ impl State {
                 Response::Ok
             }
         })
+    }
+}
+
+/// Answers [`Request::TestProxy`]. Blocks for up to about 20 seconds, so
+/// call it outside the control thread.
+pub fn test_proxy(client: &Client, group: stemma_core::model::GroupId) -> Response {
+    let Response::Config(config) = client.call(Request::GetConfig) else {
+        return Response::error("cannot read the configuration");
+    };
+    let Some(group) = config.group(group) else {
+        return Response::error("unknown proxy group");
+    };
+    let proxy = crate::relay::ProxyEndpoint::from(group);
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())
+        .and_then(|runtime| runtime.block_on(crate::relay::probe(&proxy, &group.test_url)));
+    match result {
+        Ok(latency) => Response::ProxyTest {
+            latency_ms: latency.as_millis() as u64,
+        },
+        Err(err) => Response::error(err),
     }
 }
 
