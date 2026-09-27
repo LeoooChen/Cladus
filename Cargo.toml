@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/stemma-core",
+    "crates/stemma-platform-windows",
+    "apps/stemma-engine",
+    "tests/e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+authors = ["Stemma contributors"]
+publish = false
+
+[workspace.dependencies]
+stemma-core = { path = "crates/stemma-core" }
+stemma-platform-windows = { path = "crates/stemma-platform-windows" }
+
+anyhow = "1.0.100"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+ipnet = "2.11"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0"
+tokio = { version = "1.47", default-features = false }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt", "std", "ansi"] }
+windows-sys = "0.61"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+debug = "limited"

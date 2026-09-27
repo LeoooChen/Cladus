@@ -1,0 +1,46 @@
+# cargo-deny policy. Stemma is MIT-licensed; everything compiled into its
+# binaries must be compatible with shipping under MIT.
+#
+# WinDivert (LGPL-3.0 / GPL-2.0) is deliberately NOT a Rust dependency: it is
+# a separate DLL + driver loaded at run time, shipped with its own license.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+# MPL-2.0 is file-level copyleft. It is acceptable only for unmodified
+# transitive dependencies (e.g. Tauri's CSS parser); list each one here
+# explicitly when it appears.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # LGPL bindings would be linked statically into our binaries.
+    { crate = "windivert", reason = "LGPL; WinDivert is loaded dynamically instead" },
+    { crate = "windivert-sys", reason = "LGPL; WinDivert is loaded dynamically instead" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+yanked = "deny"

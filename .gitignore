@@ -1,0 +1,7 @@
+/target
+# Downloaded by scripts/bootstrap-windows.ps1 (hash-pinned, never committed).
+/third_party/
+# Local reference checkouts of the original C++ project.
+/reference/
+*.log
+*.pdb

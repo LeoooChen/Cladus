@@ -1,0 +1,26 @@
+[package]
+name = "stemma-platform-windows"
+description = "Windows backend for Stemma: WinDivert interception, ETW process events, process queries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+stemma-core.workspace = true
+tracing.workspace = true
+windows-sys = { workspace = true, features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
+
+[lints]
+workspace = true
