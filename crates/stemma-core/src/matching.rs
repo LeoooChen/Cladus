@@ -82,7 +82,9 @@ impl CmdlinePattern {
         } else if folded.contains(['*', '?']) {
             Some(Self::Wildcard(folded))
         } else {
-            Some(Self::Keywords(folded.split_whitespace().map(str::to_owned).collect()))
+            Some(Self::Keywords(
+                folded.split_whitespace().map(str::to_owned).collect(),
+            ))
         }
     }
 
@@ -185,10 +187,22 @@ mod tests {
     #[test]
     fn cmdline_wildcard_mode_is_order_sensitive() {
         let matches = |p: &str, c: &str| CmdlinePattern::new(p).unwrap().matches(&fold(c));
-        assert!(matches("*udp_client*", r"C:\Python\python.exe udp_client.py"));
-        assert!(matches("*udp_client*8080*", "python.exe udp_client.py --port 8080"));
-        assert!(!matches("*udp_client*8080*", "python.exe udp_client.py --port 9090"));
-        assert!(!matches("*8080*udp_client*", "python.exe udp_client.py --port 8080"));
+        assert!(matches(
+            "*udp_client*",
+            r"C:\Python\python.exe udp_client.py"
+        ));
+        assert!(matches(
+            "*udp_client*8080*",
+            "python.exe udp_client.py --port 8080"
+        ));
+        assert!(!matches(
+            "*udp_client*8080*",
+            "python.exe udp_client.py --port 9090"
+        ));
+        assert!(!matches(
+            "*8080*udp_client*",
+            "python.exe udp_client.py --port 8080"
+        ));
     }
 
     #[test]

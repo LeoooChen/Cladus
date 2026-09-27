@@ -10,14 +10,46 @@ use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, PROCESSINFOCLASS, ProcessBasicInformation,
     ProcessCommandLineInformation,
 };
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE, UNICODE_STRING};
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, FILETIME, HANDLE, UNICODE_STRING};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenMutexW, OpenProcess, OpenProcessToken,
+    CreateMutexW, GetCurrentProcess, GetProcessTimes, OpenMutexW, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, SYNCHRONIZATION_SYNCHRONIZE,
 };
 
 use crate::util::OwnedHandle;
+use stemma_core::platform::PlatformError;
+
+/// Keeps concurrent Stemma engines from redirecting the same traffic and
+/// stopping one another's ETW session.
+pub struct EngineInstance {
+    _mutex: OwnedHandle,
+}
+
+impl EngineInstance {
+    pub fn acquire() -> Result<Self, PlatformError> {
+        if !is_elevated() {
+            return Err(PlatformError::Other(
+                "stemma-engine must run as administrator".to_owned(),
+            ));
+        }
+        let name = crate::util::wide("Global\\StemmaEngine");
+        // SAFETY: valid NUL-terminated name and default security attributes;
+        // OwnedHandle closes the returned handle on every path.
+        let raw = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        let error = crate::util::last_error();
+        let mutex = OwnedHandle::new(raw)
+            .ok_or_else(|| crate::util::os_error("creating the engine instance mutex", error))?;
+        if error == ERROR_ALREADY_EXISTS {
+            return Err(PlatformError::Other(
+                "another Stemma engine is already running".to_owned(),
+            ));
+        }
+        Ok(Self { _mutex: mutex })
+    }
+}
 
 /// ProcessSequenceNumber: the boot-unique identity that ETW reports as
 /// `ProcessSequenceNumber` (Windows 10 1709+).
@@ -129,7 +161,8 @@ fn create_time(handle: &OwnedHandle) -> u64 {
     };
     let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
     // SAFETY: all out pointers are valid.
-    let ok = unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) };
+    let ok =
+        unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) };
     if ok == 0 {
         return 0;
     }
@@ -227,7 +260,9 @@ mod tests {
     fn describes_the_current_process() {
         let inspector = WinProcessInspector;
         let pid = std::process::id();
-        let me = inspector.describe(pid).expect("current process is readable");
+        let me = inspector
+            .describe(pid)
+            .expect("current process is readable");
         assert_eq!(me.key.pid, pid);
         assert_ne!(me.key.instance, 0);
         assert!(me.name.to_lowercase().ends_with(".exe"), "{}", me.name);

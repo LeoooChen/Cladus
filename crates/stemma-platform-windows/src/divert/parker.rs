@@ -56,6 +56,8 @@ struct Entry {
 struct Parked {
     data: Vec<u8>,
     addr: Address,
+    /// Index of the port table (IPv4 or IPv6) that `port` belongs to.
+    family: usize,
     port: u16,
     parked_at: i64,
 }
@@ -69,6 +71,7 @@ impl Parker {
                 packet: Mutex::new(Parked {
                     data: Vec::with_capacity(MAX_SYN),
                     addr: Address::zeroed(),
+                    family: 0,
                     port: 0,
                     parked_at: 0,
                 }),
@@ -100,7 +103,13 @@ impl Parker {
 
     /// Copies a SYN into the pool. Returns its (generation tag, index), or
     /// `None` if the pool is full or the packet too large.
-    pub fn park(&self, packet: &[u8], addr: &Address, port: u16) -> Option<(u32, u32)> {
+    pub fn park(
+        &self,
+        packet: &[u8],
+        addr: &Address,
+        family: usize,
+        port: u16,
+    ) -> Option<(u32, u32)> {
         if packet.len() > MAX_SYN {
             return None;
         }
@@ -110,6 +119,7 @@ impl Parker {
         parked.data.clear();
         parked.data.extend_from_slice(packet);
         parked.addr = *addr;
+        parked.family = family;
         parked.port = port;
         parked.parked_at = qpc_now();
         drop(parked);
@@ -133,7 +143,7 @@ impl Parker {
 
     /// The injector thread: sends released SYNs and runs the watchdog until
     /// [`stop`](Self::stop) is called, then releases everything still parked.
-    pub fn run(&self, tracker: &PortTracker, send: Send<'_>) {
+    pub fn run(&self, trackers: &[PortTracker; 2], send: Send<'_>) {
         let timer = millisecond_timer();
         if timer.is_none() {
             warn!("no waitable timer; SYN watchdog runs every 50 ms");
@@ -146,10 +156,10 @@ impl Parker {
             // SAFETY: all handles are valid for the duration of the wait.
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 50) };
             self.drain(send);
-            self.sweep(tracker, send, false);
+            self.sweep(trackers, send, false);
         }
         self.drain(send);
-        self.sweep(tracker, send, true);
+        self.sweep(trackers, send, true);
     }
 
     pub fn stop(&self) {
@@ -190,19 +200,25 @@ impl Parker {
 
     /// Sends every SYN that waited past the watchdog (all of them when
     /// `force` is set) unchanged, pinning its port `Abandoned` first.
-    pub(crate) fn sweep(&self, tracker: &PortTracker, send: Send<'_>, force: bool) {
+    pub(crate) fn sweep(&self, trackers: &[PortTracker; 2], send: Send<'_>, force: bool) {
         let now = qpc_now();
         for (index, entry) in self.entries.iter().enumerate() {
             if !entry.busy.load(Acquire) {
                 continue;
             }
-            let (port, syn_ts, parked_at) = {
+            let (family, port, syn_ts, parked_at) = {
                 let parked = entry.packet.lock().unwrap();
-                (parked.port, parked.addr.timestamp, parked.parked_at)
+                (
+                    parked.family,
+                    parked.port,
+                    parked.addr.timestamp,
+                    parked.parked_at,
+                )
             };
             if !force && now - parked_at < self.watchdog {
                 continue;
             }
+            let tracker = &trackers[family];
             let view = tracker.load(port);
             if view.word.state() != SlotState::Pending || view.word.index() != index as u32 {
                 continue;
@@ -210,7 +226,9 @@ impl Parker {
             if !tracker.pin_abandoned(port, view.word, syn_ts) {
                 continue; // the decision won the race
             }
-            if let Some((mut packet, mut addr)) = self.take_out(index as u32, view.word.generation()) {
+            if let Some((mut packet, mut addr)) =
+                self.take_out(index as u32, view.word.generation())
+            {
                 if !force {
                     self.released_by_watchdog.fetch_add(1, Relaxed);
                     debug!(port, "SYN released without a decision");
@@ -259,12 +277,16 @@ fn millisecond_timer() -> Option<OwnedHandle> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
     use crate::divert::tracker::Publish;
 
-    const IP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+    const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+
+    fn trackers() -> [PortTracker; 2] {
+        [PortTracker::new(100), PortTracker::new(100)]
+    }
 
     fn syn_addr(timestamp: i64) -> Address {
         let mut addr = Address::zeroed();
@@ -275,23 +297,24 @@ mod tests {
     #[test]
     fn pool_slots_are_reused_with_a_new_generation() {
         let parker = Parker::new(2, i64::MAX);
-        let (g1, i1) = parker.park(&[1], &syn_addr(0), 1).unwrap();
-        let (_, i2) = parker.park(&[2], &syn_addr(0), 2).unwrap();
+        let (g1, i1) = parker.park(&[1], &syn_addr(0), 0, 1).unwrap();
+        let (_, i2) = parker.park(&[2], &syn_addr(0), 0, 2).unwrap();
         assert_ne!(i1, i2);
-        assert_eq!(parker.park(&[3], &syn_addr(0), 3), None, "pool is full");
+        assert_eq!(parker.park(&[3], &syn_addr(0), 0, 3), None, "pool is full");
         parker.free(i1);
-        let (g3, i3) = parker.park(&[4], &syn_addr(0), 4).unwrap();
+        let (g3, i3) = parker.park(&[4], &syn_addr(0), 0, 4).unwrap();
         assert_eq!(i3, i1);
         assert_ne!(g3, g1);
         assert_eq!((parker.in_use(), parker.peak()), (2, 2));
-        assert_eq!(parker.park(&[0; MAX_SYN + 1], &syn_addr(0), 5), None);
+        assert_eq!(parker.park(&[0; MAX_SYN + 1], &syn_addr(0), 0, 5), None);
     }
 
     #[test]
     fn released_syn_is_sent_with_its_decision() {
-        let tracker = PortTracker::new(100);
+        let trackers = trackers();
+        let tracker = &trackers[0];
         let parker = Parker::new(4, i64::MAX);
-        let (generation, index) = parker.park(&[0xAB], &syn_addr(20), 5000).unwrap();
+        let (generation, index) = parker.park(&[0xAB], &syn_addr(20), 0, 5000).unwrap();
         assert!(tracker.try_park(5000, Word::EMPTY, generation, index, 20));
         let decision = Decision::Proxied { group: 1 };
         let Publish::Released(word) = tracker.publish(5000, decision, IP, 443, 10) else {
@@ -300,7 +323,8 @@ mod tests {
         parker.release(word, decision);
 
         let sent = RefCell::new(Vec::new());
-        let send = |p: &mut [u8], _: &mut Address, d: Decision| sent.borrow_mut().push((p.to_vec(), d));
+        let send =
+            |p: &mut [u8], _: &mut Address, d: Decision| sent.borrow_mut().push((p.to_vec(), d));
         parker.drain(&send);
         assert_eq!(*sent.borrow(), vec![(vec![0xAB], decision)]);
         assert_eq!(parker.in_use(), 0);
@@ -308,14 +332,16 @@ mod tests {
 
     #[test]
     fn watchdog_releases_undecided_syn_and_pins_the_port() {
-        let tracker = PortTracker::new(100);
+        let trackers = trackers();
+        let tracker = &trackers[1];
         let parker = Parker::new(4, 0);
-        let (generation, index) = parker.park(&[0xCD], &syn_addr(20), 5000).unwrap();
+        let (generation, index) = parker.park(&[0xCD], &syn_addr(20), 1, 5000).unwrap();
         assert!(tracker.try_park(5000, Word::EMPTY, generation, index, 20));
 
         let sent = RefCell::new(Vec::new());
-        let send = |p: &mut [u8], _: &mut Address, d: Decision| sent.borrow_mut().push((p.to_vec(), d));
-        parker.sweep(&tracker, &send, false);
+        let send =
+            |p: &mut [u8], _: &mut Address, d: Decision| sent.borrow_mut().push((p.to_vec(), d));
+        parker.sweep(&trackers, &send, false);
         assert_eq!(*sent.borrow(), vec![(vec![0xCD], Decision::Direct)]);
         assert_eq!(tracker.state(5000), SlotState::Abandoned);
         assert_eq!(parker.released_by_watchdog.load(Relaxed), 1);

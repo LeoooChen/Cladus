@@ -1,29 +1,44 @@
 //! Connects a platform backend to the decision core.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use stemma_core::config::Config;
 use stemma_core::decision::DecisionCore;
-use stemma_core::model::{FlowQuery, GroupId, Verdict};
+use stemma_core::model::{DirectReason, FlowQuery, GroupId, ProcessKey, ProcessView, Verdict};
 use stemma_core::platform::{
-    Counter, DecisionOracle, ProcessEvent, ProcessInspector, ProcessSource, RedirectedTcp,
-    TcpHandoff, TrafficInterceptor,
+    Counter, DecisionOracle, Handoff, ProcessEvent, ProcessInspector, ProcessSource, RedirectedTcp,
+    TrafficInterceptor,
 };
+use stemma_core::policy::{PolicyId, PolicyTable};
 use tokio::runtime::{Handle, Runtime};
 use tracing::{debug, info, warn};
 
 use crate::relay::{self, ProxyEndpoint, RelayCounters};
+use crate::udp::{UdpCounters, UdpRelay};
 
 /// The OS-specific parts the engine runs on.
 pub struct Platform {
     pub processes: Arc<dyn ProcessSource>,
     pub inspector: Arc<dyn ProcessInspector>,
     pub interceptor: Box<dyn TrafficInterceptor>,
+}
+
+type Groups = HashMap<GroupId, Arc<ProxyEndpoint>>;
+
+fn groups_of(config: &Config) -> Arc<Groups> {
+    Arc::new(
+        config
+            .proxy_groups
+            .iter()
+            .map(|group| (group.id, Arc::new(ProxyEndpoint::from(group))))
+            .collect(),
+    )
 }
 
 /// The decision core behind a lock that lets connection decisions go first.
@@ -35,7 +50,11 @@ struct Core {
     /// Threads waiting to make a connection decision.
     urgent: AtomicUsize,
     inspector: Arc<dyn ProcessInspector>,
+    /// Read for every proxied datagram, so kept outside the core's lock.
+    policies: RwLock<Arc<PolicyTable>>,
     resync_needed: AtomicBool,
+    processes: Arc<dyn ProcessSource>,
+    changed: Condvar,
 }
 
 impl Core {
@@ -61,54 +80,115 @@ impl Core {
         }
         self.lock_background()
             .apply_event(event, self.inspector.as_ref(), Instant::now());
+        self.changed.notify_all();
     }
 }
 
 impl DecisionOracle for Core {
     fn decide(&self, query: &FlowQuery) -> Verdict {
-        self.lock_urgent()
-            .decide(query, self.inspector.as_ref(), Instant::now())
+        let mut core = self.lock_urgent();
+        let verdict = core.decide(query, self.inspector.as_ref(), Instant::now());
+        if query.pid <= 4
+            || verdict != Verdict::Direct(DirectReason::NotAssigned)
+            || !core.take_ancestry_retry(query.pid)
+        {
+            return verdict;
+        }
+        // Do not hold the core while ETW delivers a short-lived parent's
+        // buffered start event. The SYN watchdog remains the fail-open bound.
+        drop(core);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let started = Instant::now();
+        self.processes.flush();
+        debug!(pid = query.pid, elapsed = ?started.elapsed(), "flushed process events for unresolved ancestry");
+        core = self.lock_urgent();
+        loop {
+            let now = Instant::now();
+            let verdict = core.decide(query, self.inspector.as_ref(), now);
+            if verdict != Verdict::Direct(DirectReason::NotAssigned)
+                || !core.has_unresolved_ancestry(query.pid)
+                || now >= deadline
+            {
+                return verdict;
+            }
+            core = self
+                .changed
+                .wait_timeout(core, deadline - now)
+                .expect("decision core poisoned")
+                .0;
+        }
+    }
+
+    fn allows_destination(&self, policy: PolicyId, dst: SocketAddr) -> bool {
+        self.policies.read().unwrap().check(policy, dst).is_ok()
     }
 }
 
 pub struct Engine {
     core: Arc<Core>,
+    groups: Arc<RwLock<Arc<Groups>>>,
     processes: Arc<dyn ProcessSource>,
     interceptor: Box<dyn TrafficInterceptor>,
     relays: Arc<RelayCounters>,
+    udp: Arc<UdpCounters>,
     housekeeping: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
     runtime: Option<Runtime>,
 }
 
 impl Engine {
     pub fn start(config: &Config, platform: Platform) -> anyhow::Result<Self> {
+        config.validate()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("stemma-relay")
             .enable_all()
             .build()?;
+        let core_state = DecisionCore::new(config, std::process::id());
         let core = Arc::new(Core {
-            state: Mutex::new(DecisionCore::new(config, std::process::id())),
+            policies: RwLock::new(core_state.policies()),
+            state: Mutex::new(core_state),
             urgent: AtomicUsize::new(0),
             inspector: platform.inspector,
             resync_needed: AtomicBool::new(false),
+            processes: Arc::clone(&platform.processes),
+            changed: Condvar::new(),
         });
-        let groups: HashMap<GroupId, Arc<ProxyEndpoint>> = config
-            .proxy_groups
-            .iter()
-            .map(|group| (group.id, Arc::new(ProxyEndpoint::from(group))))
-            .collect();
+        let groups = Arc::new(RwLock::new(groups_of(config)));
         let relays = Arc::new(RelayCounters::default());
-        let handoff: TcpHandoff = {
-            let (runtime, relays) = (runtime.handle().clone(), Arc::clone(&relays));
-            Arc::new(move |redirected| spawn_relay(&runtime, &groups, &relays, redirected))
+        let udp = Arc::new(UdpCounters::default());
+        // The UDP relay needs the injector that starting interception returns;
+        // datagrams arriving before that are dropped.
+        let udp_relay: Arc<OnceLock<Arc<UdpRelay>>> = Arc::default();
+        let handoff = Handoff {
+            tcp: {
+                let (runtime, groups, relays) = (
+                    runtime.handle().clone(),
+                    Arc::clone(&groups),
+                    Arc::clone(&relays),
+                );
+                Arc::new(move |redirected: RedirectedTcp| {
+                    let proxy = groups.read().unwrap().get(&redirected.group).cloned();
+                    spawn_relay(&runtime, proxy, &relays, redirected);
+                })
+            },
+            udp: {
+                let (udp_relay, groups) = (Arc::clone(&udp_relay), Arc::clone(&groups));
+                Arc::new(move |datagram| {
+                    if let Some(relay) = udp_relay.get() {
+                        let proxy = groups.read().unwrap().get(&datagram.group).cloned();
+                        relay.send(datagram, proxy);
+                    }
+                })
+            },
         };
         let housekeeping = spawn_housekeeping(Arc::clone(&core), Arc::clone(&platform.processes));
         let mut engine = Self {
             core,
+            groups,
             processes: platform.processes,
             interceptor: platform.interceptor,
             relays,
+            udp,
             housekeeping: Some(housekeeping),
             runtime: Some(runtime),
         };
@@ -120,7 +200,14 @@ impl Engine {
         // Announce the processes that are already running.
         engine.processes.request_resync();
         let oracle: Arc<dyn DecisionOracle> = engine.core.clone();
-        engine.interceptor.start(oracle, handoff)?;
+        let injector = engine.interceptor.start(oracle, handoff)?;
+        let runtime = engine
+            .runtime
+            .as_ref()
+            .expect("runtime is running")
+            .handle()
+            .clone();
+        let _ = udp_relay.set(UdpRelay::new(runtime, injector, Arc::clone(&engine.udp)));
         info!("engine started");
         Ok(engine)
     }
@@ -136,7 +223,44 @@ impl Engine {
         ];
         counters.extend(self.interceptor.counters());
         counters.extend(self.relays.snapshot());
+        counters.extend(self.udp.snapshot());
         counters
+    }
+
+    pub fn processes(&self) -> Vec<ProcessView> {
+        self.core.lock_background().snapshot()
+    }
+
+    /// Call only with a validated configuration.
+    pub fn reconfigure(&mut self, config: &Config) {
+        let mut core = self.core.lock_urgent();
+        core.reconfigure(config, self.core.inspector.as_ref());
+        *self.core.policies.write().unwrap() = core.policies();
+        *self.groups.write().unwrap() = groups_of(config);
+        drop(core);
+        self.interceptor.refresh_assignments();
+    }
+
+    pub fn set_manual(&mut self, process: ProcessKey, group: Option<GroupId>) -> bool {
+        if self.core.inspector.live_key(process.pid) != Some(process) {
+            return false;
+        }
+        let changed = self.core.lock_urgent().set_manual(
+            process.pid, group, self.core.inspector.as_ref(), Instant::now(),
+        );
+        self.interceptor.refresh_assignments();
+        changed
+    }
+
+    pub fn set_excluded(&mut self, process: ProcessKey, rule_id: &str, excluded: bool) -> bool {
+        if self.core.inspector.live_key(process.pid) != Some(process) {
+            return false;
+        }
+        let changed = self.core.lock_urgent().set_excluded(
+            process.pid, rule_id, excluded, self.core.inspector.as_ref(), Instant::now(),
+        );
+        self.interceptor.refresh_assignments();
+        changed
     }
 
     /// Stops the engine and returns its final counters.
@@ -180,9 +304,13 @@ fn spawn_housekeeping(
         .name("stemma-housekeeping".to_owned())
         .spawn(move || {
             let mut last_resync = Instant::now();
-            while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Duration::from_secs(1)) {
+            while let Err(mpsc::RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(Duration::from_secs(1))
+            {
                 core.lock_background().tick(Instant::now());
-                if core.resync_needed.load(Relaxed) && last_resync.elapsed() >= Duration::from_secs(1) {
+                if core.resync_needed.load(Relaxed)
+                    && last_resync.elapsed() >= Duration::from_secs(1)
+                {
                     core.resync_needed.store(false, Relaxed);
                     last_resync = Instant::now();
                     processes.request_resync();
@@ -195,18 +323,20 @@ fn spawn_housekeeping(
 
 fn spawn_relay(
     runtime: &Handle,
-    groups: &HashMap<GroupId, Arc<ProxyEndpoint>>,
+    proxy: Option<Arc<ProxyEndpoint>>,
     counters: &Arc<RelayCounters>,
     redirected: RedirectedTcp,
 ) {
-    let Some(proxy) = groups.get(&redirected.group).cloned() else {
+    let Some(proxy) = proxy else {
         warn!(group = %redirected.group, "no such proxy group; closing the connection");
         return;
     };
     let counters = Arc::clone(counters);
     counters.started.fetch_add(1, Relaxed);
     counters.active.fetch_add(1, Relaxed);
+    let active = ActiveRelay(Arc::clone(&counters));
     runtime.spawn(async move {
+        let _active = active;
         let RedirectedTcp {
             stream,
             original_dst,
@@ -230,7 +360,14 @@ fn spawn_relay(
                 warn!(target = %original_dst, proxy = %format!("{}:{}", proxy.host, proxy.port), "relay failed: {err:#}");
             }
         }
-        counters.active.fetch_sub(1, Relaxed);
         drop(lease);
     });
+}
+
+struct ActiveRelay(Arc<RelayCounters>);
+
+impl Drop for ActiveRelay {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Relaxed);
+    }
 }

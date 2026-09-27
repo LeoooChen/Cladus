@@ -3,13 +3,15 @@
 //! A backend provides process events ([`ProcessSource`]), on-demand process
 //! queries ([`ProcessInspector`]) and traffic interception
 //! ([`TrafficInterceptor`]). The interceptor asks a [`DecisionOracle`] about
-//! every new connection and hands redirected connections back to the engine.
+//! every new connection and socket, hands redirected TCP connections and UDP
+//! datagrams to the engine, and injects UDP replies back.
 
 use std::fmt;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 
 use crate::model::{FlowQuery, GroupId, ProcessInfo, ProcessKey, Verdict};
+use crate::policy::PolicyId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
@@ -31,7 +33,9 @@ pub enum ProcessEvent {
     Exited(ProcessKey),
     /// The source dropped `count` events; its view may be incomplete until
     /// the next resync.
-    Lost { count: u64 },
+    Lost {
+        count: u64,
+    },
 }
 
 pub type ProcessEventSink = Box<dyn Fn(ProcessEvent) + Send + Sync>;
@@ -41,6 +45,9 @@ pub trait ProcessSource: Send + Sync {
     fn start(&self, sink: ProcessEventSink) -> Result<(), PlatformError>;
     /// Asks the source to announce every running process again.
     fn request_resync(&self);
+    /// Makes already recorded events available promptly. Used when a first
+    /// connection races the events of a short-lived ancestor.
+    fn flush(&self) {}
     fn stop(&self);
 }
 
@@ -67,6 +74,9 @@ pub trait ProcessInspector: Send + Sync {
 
 pub trait DecisionOracle: Send + Sync {
     fn decide(&self, query: &FlowQuery) -> Verdict;
+    /// Whether a datagram of a proxied socket may go to `dst` under the
+    /// socket's policy. Called per datagram, so it must be cheap.
+    fn allows_destination(&self, policy: PolicyId, dst: SocketAddr) -> bool;
 }
 
 /// Releases the backend state of one redirected connection when dropped.
@@ -103,7 +113,32 @@ pub struct RedirectedTcp {
     pub lease: FlowLease,
 }
 
-pub type TcpHandoff = Arc<dyn Fn(RedirectedTcp) + Send + Sync>;
+/// A datagram an application sent from a proxied UDP socket. It was taken
+/// off the network; the engine forwards it through the proxy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RedirectedUdp {
+    /// The application's socket address.
+    pub app: SocketAddr,
+    /// Backend socket generation; replies to a closed/reused socket are discarded.
+    pub generation: u64,
+    pub dst: SocketAddr,
+    pub group: GroupId,
+    pub payload: Vec<u8>,
+}
+
+/// Delivers datagrams to applications as if they came from the network.
+pub trait UdpInjector: Send + Sync {
+    /// Delivers `payload` to the application socket `app`, from `from`.
+    fn inject(&self, app: SocketAddr, generation: u64, from: SocketAddr, payload: &[u8]) -> bool;
+}
+
+/// Where the interceptor delivers redirected traffic. Both callbacks run on
+/// backend threads and must return quickly.
+#[derive(Clone)]
+pub struct Handoff {
+    pub tcp: Arc<dyn Fn(RedirectedTcp) + Send + Sync>,
+    pub udp: Arc<dyn Fn(RedirectedUdp) + Send + Sync>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Counter {
@@ -112,9 +147,15 @@ pub struct Counter {
 }
 
 pub trait TrafficInterceptor: Send {
-    fn start(&mut self, oracle: Arc<dyn DecisionOracle>, tcp: TcpHandoff)
-    -> Result<(), PlatformError>;
+    /// Starts intercepting. Returns the injector for UDP replies.
+    fn start(
+        &mut self,
+        oracle: Arc<dyn DecisionOracle>,
+        handoff: Handoff,
+    ) -> Result<Arc<dyn UdpInjector>, PlatformError>;
     /// Stops interception. Traffic must keep flowing directly afterwards.
     fn stop(&mut self);
     fn counters(&self) -> Vec<Counter>;
+    /// Invalidates cached socket assignments after rules or manual choices change.
+    fn refresh_assignments(&self) {}
 }

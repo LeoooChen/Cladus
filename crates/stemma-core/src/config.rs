@@ -94,6 +94,8 @@ pub struct Rule {
     pub image_path_pattern: String,
     pub protocol: RuleProtocol,
     pub proxy_group_id: GroupId,
+    /// Which destinations of covered processes are proxied.
+    pub dst_filter: DestinationFilter,
 }
 
 impl Default for Rule {
@@ -107,7 +109,86 @@ impl Default for Rule {
             image_path_pattern: String::new(),
             protocol: RuleProtocol::default(),
             proxy_group_id: GroupId(0),
+            dst_filter: DestinationFilter::default(),
         }
+    }
+}
+
+/// Destinations a rule applies to. Exclusions win; a non-empty include list
+/// admits only what it lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DestinationFilter {
+    pub include_cidrs: Vec<Cidr>,
+    pub exclude_cidrs: Vec<Cidr>,
+    pub include_ports: Vec<PortRange>,
+    pub exclude_ports: Vec<PortRange>,
+}
+
+impl DestinationFilter {
+    pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
+        !self.exclude_cidrs.iter().any(|c| c.contains(ip))
+            && !self.exclude_ports.iter().any(|p| p.contains(port))
+            && (self.include_cidrs.is_empty() || self.include_cidrs.iter().any(|c| c.contains(ip)))
+            && (self.include_ports.is_empty()
+                || self.include_ports.iter().any(|p| p.contains(port)))
+    }
+}
+
+/// A port or an inclusive range such as `8000-8100`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortRange {
+    pub first: u16,
+    pub last: u16,
+}
+
+impl PortRange {
+    pub fn contains(&self, port: u16) -> bool {
+        (self.first..=self.last).contains(&port)
+    }
+}
+
+impl FromStr for PortRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parse = |p: &str| {
+            p.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port range `{s}`"))
+        };
+        let (first, last) = match s.split_once('-') {
+            Some((a, b)) => (parse(a)?, parse(b)?),
+            None => (parse(s)?, parse(s)?),
+        };
+        if first > last {
+            return Err(format!("invalid port range `{s}`"));
+        }
+        Ok(Self { first, last })
+    }
+}
+
+impl fmt::Display for PortRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}-{}", self.first, self.last)
+        }
+    }
+}
+
+impl Serialize for PortRange {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -226,7 +307,9 @@ impl<'de> Deserialize<'de> for Cidr {
 pub enum ConfigError {
     #[error("invalid configuration JSON: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("unsupported configuration version {found} (this build reads version {CONFIG_VERSION})")]
+    #[error(
+        "unsupported configuration version {found} (this build reads version {CONFIG_VERSION})"
+    )]
     Version { found: u32 },
     #[error("invalid configuration: {0}")]
     Invalid(String),
@@ -271,6 +354,12 @@ impl Config {
             if group.username.len() > 255 || group.password.len() > 255 {
                 problems.push(format!(
                     "proxy group {}: SOCKS5 username and password are limited to 255 bytes",
+                    group.id
+                ));
+            }
+            if group.username.is_empty() != group.password.is_empty() {
+                problems.push(format!(
+                    "proxy group {}: SOCKS5 authentication needs both username and password",
                     group.id
                 ));
             }
@@ -340,6 +429,26 @@ mod tests {
     }
 
     #[test]
+    fn destination_filter() {
+        let filter: DestinationFilter = serde_json::from_str(
+            r#"{"exclude_cidrs": ["1.1.1.0/24"], "include_ports": ["443", "8000-8100"]}"#,
+        )
+        .unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(filter.allows(ip("8.8.8.8"), 443));
+        assert!(filter.allows(ip("8.8.8.8"), 8100));
+        assert!(!filter.allows(ip("8.8.8.8"), 80));
+        assert!(!filter.allows(ip("1.1.1.1"), 443));
+        assert!(DestinationFilter::default().allows(ip("::1"), 1));
+        assert!("9-1".parse::<PortRange>().is_err());
+        assert!("x".parse::<PortRange>().is_err());
+        assert_eq!(
+            serde_json::to_string(&filter.include_ports).unwrap(),
+            r#"["443","8000-8100"]"#
+        );
+    }
+
+    #[test]
     fn unknown_fields_are_rejected() {
         let err = Config::from_json(r#"{"proxy_group": []}"#).unwrap_err();
         assert!(matches!(err, ConfigError::Json(_)), "{err}");
@@ -362,7 +471,10 @@ mod tests {
             "missing proxy group 7",
             "watchdog_ms",
         ] {
-            assert!(message.contains(expected), "missing `{expected}` in: {message}");
+            assert!(
+                message.contains(expected),
+                "missing `{expected}` in: {message}"
+            );
         }
     }
 

@@ -1,66 +1,49 @@
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+//! TCP interception: CONNECT decisions from the socket layer, SYN parking,
+//! and reflection of proxied flows into the local acceptor.
+
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use stemma_core::config::SynParking;
 use stemma_core::model::{FlowQuery, GroupId, Protocol, Verdict};
-use stemma_core::platform::{
-    Counter, DecisionOracle, FlowLease, PlatformError, RedirectedTcp, TcpHandoff,
-    TrafficInterceptor,
-};
+use stemma_core::platform::{Counter, DecisionOracle, FlowLease, PlatformError, RedirectedTcp};
 use tracing::{debug, error, info, warn};
 use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 
 use super::ffi::{self, Address, Handle, SocketData, WinDivert};
-use super::packet::Ipv4Tcp;
+use super::packet::{self, Packet};
 use super::parker::Parker;
 use super::tracker::{Decision, PortTracker, Publish, SlotState};
+use super::{Counters, NETWORK_PRIORITY, spawn};
 use crate::util::qpc_frequency;
 
-const NETWORK_FILTER: &str = "outbound and !loopback and ip and tcp";
-// No `ip` here: the socket layer reports IPv4 endpoints IPv4-mapped, so they
-// never match it. IPv6 connections are skipped in code instead.
-const SOCKET_FILTER: &str = "outbound and !loopback and tcp and (event == CONNECT or event == CLOSE)";
+const NETWORK_FILTER: &str = "outbound and !loopback and tcp";
+const SOCKET_FILTER: &str =
+    "outbound and !loopback and tcp and (event == CONNECT or event == CLOSE)";
 const NETWORK_WORKERS: usize = 2;
-/// Above the default of 0, so Stemma sees packets before other WinDivert
-/// users (such as Clew) and sends them on to those afterwards.
-const NETWORK_PRIORITY: i16 = 1000;
 
-pub struct TcpInterceptor {
-    api: Arc<WinDivert>,
-    parking: SynParking,
-    counters: Arc<Counters>,
-    running: Option<Running>,
-    /// Counters as they were when interception stopped.
-    final_counters: Option<Vec<Counter>>,
+/// One port table per address family: index 0 for IPv4, 1 for IPv6.
+type Trackers = [PortTracker; 2];
+
+fn family(ip: IpAddr) -> usize {
+    usize::from(ip.is_ipv6())
 }
 
-#[derive(Default)]
-struct Counters {
-    connects: AtomicU64,
-    proxied: AtomicU64,
-    direct: AtomicU64,
-    echoes: AtomicU64,
-    late_rejected: AtomicU64,
-    parked: AtomicU64,
-    park_failed: AtomicU64,
-    accepted: AtomicU64,
-    rejected_peers: AtomicU64,
-}
-
-/// State shared by the packet threads.
+/// State shared by the TCP threads.
 struct Shared {
-    tracker: Arc<PortTracker>,
+    trackers: Arc<Trackers>,
     network: Handle,
     parker: Option<Parker>,
     acceptor_port: u16,
     counters: Arc<Counters>,
 }
 
-struct Running {
+pub(super) struct Tcp {
     shared: Arc<Shared>,
     socket: Arc<Handle>,
     stop: Arc<AtomicBool>,
@@ -70,50 +53,31 @@ struct Running {
     acceptor: JoinHandle<()>,
 }
 
-impl TcpInterceptor {
-    pub fn new(api: Arc<WinDivert>, parking: SynParking) -> Self {
-        Self {
-            api,
-            parking,
-            counters: Arc::default(),
-            running: None,
-            final_counters: None,
-        }
-    }
-}
-
-impl Drop for TcpInterceptor {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-impl TrafficInterceptor for TcpInterceptor {
-    fn start(
-        &mut self,
+impl Tcp {
+    pub(super) fn start(
+        api: &Arc<WinDivert>,
+        parking: &SynParking,
         oracle: Arc<dyn DecisionOracle>,
-        handoff: TcpHandoff,
-    ) -> Result<(), PlatformError> {
-        if self.running.is_some() {
-            return Ok(());
-        }
+        handoff: Arc<dyn Fn(RedirectedTcp) + Send + Sync>,
+        counters: Arc<Counters>,
+    ) -> Result<Self, PlatformError> {
         let frequency = qpc_frequency();
-        // A decision older than this does not belong to the SYN at hand.
-        let tracker = Arc::new(PortTracker::new(frequency / 100));
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| {
+        // A decision older than 10 ms does not belong to the SYN at hand.
+        let ttl = frequency / 100;
+        let trackers = Arc::new([PortTracker::new(ttl), PortTracker::new(ttl)]);
+        let listener = dual_stack_listener().map_err(|e| {
             PlatformError::Other(format!("cannot listen for redirected connections: {e}"))
         })?;
         let acceptor_port = listener
             .local_addr()
             .map_err(|e| PlatformError::Other(e.to_string()))?
             .port();
-
-        let network = Handle::open(&self.api, NETWORK_FILTER, ffi::LAYER_NETWORK, NETWORK_PRIORITY, 0)?;
+        let network = Handle::open(api, NETWORK_FILTER, ffi::LAYER_NETWORK, NETWORK_PRIORITY, 0)?;
         network.set_param(ffi::PARAM_QUEUE_LENGTH, 16_384);
         network.set_param(ffi::PARAM_QUEUE_TIME, 2_000);
         network.set_param(ffi::PARAM_QUEUE_SIZE, 16 << 20);
         let socket = Arc::new(Handle::open(
-            &self.api,
+            api,
             SOCKET_FILTER,
             ffi::LAYER_SOCKET,
             0,
@@ -126,20 +90,20 @@ impl TrafficInterceptor for TcpInterceptor {
                 network.param(ffi::PARAM_VERSION_MINOR)
             ),
             acceptor_port,
-            syn_parking = self.parking.enabled,
+            syn_parking = parking.enabled,
             "TCP interception started"
         );
 
-        let parker = self.parking.enabled.then(|| {
-            let watchdog = frequency * i64::from(self.parking.watchdog_ms) / 1000;
-            Parker::new(self.parking.pool_size as usize, watchdog)
+        let parker = parking.enabled.then(|| {
+            let watchdog = frequency * i64::from(parking.watchdog_ms) / 1000;
+            Parker::new(parking.pool_size as usize, watchdog)
         });
         let shared = Arc::new(Shared {
-            tracker: Arc::clone(&tracker),
+            trackers: Arc::clone(&trackers),
             network,
             parker,
             acceptor_port,
-            counters: Arc::clone(&self.counters),
+            counters: Arc::clone(&counters),
         });
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -151,7 +115,7 @@ impl TrafficInterceptor for TcpInterceptor {
             let shared = Arc::clone(&shared);
             spawn("stemma-tcp-parking", move || {
                 let parker = shared.parker.as_ref().expect("parking enabled");
-                parker.run(&shared.tracker, &|packet, addr, decision| {
+                parker.run(&shared.trackers, &|packet, addr, decision| {
                     send_decided(&shared, packet, addr, decision);
                 });
             })
@@ -159,14 +123,16 @@ impl TrafficInterceptor for TcpInterceptor {
         let workers = (0..NETWORK_WORKERS)
             .map(|i| {
                 let shared = Arc::clone(&shared);
-                spawn(&format!("stemma-tcp-net-{i}"), move || network_loop(&shared))
+                spawn(&format!("stemma-tcp-net-{i}"), move || {
+                    network_loop(&shared)
+                })
             })
             .collect();
         let acceptor = spawn("stemma-tcp-accept", {
-            let (stop, counters) = (Arc::clone(&stop), Arc::clone(&self.counters));
-            move || accept_loop(&listener, &tracker, &handoff, &stop, &counters)
+            let stop = Arc::clone(&stop);
+            move || accept_loop(&listener, &trackers, handoff.as_ref(), &stop, &counters)
         });
-        self.running = Some(Running {
+        Ok(Self {
             shared,
             socket,
             stop,
@@ -174,91 +140,63 @@ impl TrafficInterceptor for TcpInterceptor {
             socket_thread,
             injector,
             acceptor,
-        });
-        Ok(())
+        })
     }
 
-    fn stop(&mut self) {
-        let Some(running) = self.running.take() else {
-            return;
-        };
-        running.stop.store(true, Relaxed);
+    pub(super) fn stop(self) {
+        self.stop.store(true, Relaxed);
         // From here on packets are no longer captured; the workers still send
         // on what is already queued.
-        running.shared.network.shutdown_recv();
-        for worker in running.workers {
+        self.shared.network.shutdown_recv();
+        for worker in self.workers {
             let _ = worker.join();
         }
-        running.socket.shutdown_recv();
-        let _ = running.socket_thread.join();
-        if let Some(parker) = &running.shared.parker {
+        self.socket.shutdown_recv();
+        let _ = self.socket_thread.join();
+        if let Some(parker) = &self.shared.parker {
             parker.stop();
         }
-        if let Some(injector) = running.injector {
+        if let Some(injector) = self.injector {
             let _ = injector.join();
         }
-        let wake = SocketAddr::from((Ipv4Addr::LOCALHOST, running.shared.acceptor_port));
+        let wake = SocketAddr::from((Ipv6Addr::LOCALHOST, self.shared.acceptor_port));
         let _ = TcpStream::connect_timeout(&wake, Duration::from_secs(1));
-        let _ = running.acceptor.join();
-        self.final_counters = Some(self.collect(running.shared.parker.as_ref()));
+        let _ = self.acceptor.join();
         info!("TCP interception stopped");
     }
 
-    fn counters(&self) -> Vec<Counter> {
-        match &self.running {
-            Some(running) => self.collect(running.shared.parker.as_ref()),
-            None => self
-                .final_counters
-                .clone()
-                .unwrap_or_else(|| self.collect(None)),
-        }
+    pub(super) fn parking_counters(&self) -> Vec<Counter> {
+        let Some(parker) = &self.shared.parker else {
+            return Vec::new();
+        };
+        vec![
+            Counter {
+                name: "syn.released_by_decision",
+                value: parker.released_by_decision.load(Relaxed),
+            },
+            Counter {
+                name: "syn.released_by_watchdog",
+                value: parker.released_by_watchdog.load(Relaxed),
+            },
+            Counter {
+                name: "syn.pool_in_use",
+                value: u64::from(parker.in_use()),
+            },
+            Counter {
+                name: "syn.pool_peak",
+                value: u64::from(parker.peak()),
+            },
+        ]
     }
 }
 
-impl TcpInterceptor {
-    fn collect(&self, parker: Option<&Parker>) -> Vec<Counter> {
-        let c = &self.counters;
-        let mut counters = vec![
-            counter("tcp.connects", &c.connects),
-            counter("tcp.proxied", &c.proxied),
-            counter("tcp.direct", &c.direct),
-            counter("tcp.echoes_ignored", &c.echoes),
-            counter("tcp.late_rejected", &c.late_rejected),
-            counter("tcp.accepted", &c.accepted),
-            counter("tcp.rejected_peers", &c.rejected_peers),
-            counter("syn.parked", &c.parked),
-            counter("syn.park_failed", &c.park_failed),
-        ];
-        if let Some(parker) = parker {
-            counters.extend([
-                counter("syn.released_by_decision", &parker.released_by_decision),
-                counter("syn.released_by_watchdog", &parker.released_by_watchdog),
-                Counter {
-                    name: "syn.pool_in_use",
-                    value: u64::from(parker.in_use()),
-                },
-                Counter {
-                    name: "syn.pool_peak",
-                    value: u64::from(parker.peak()),
-                },
-            ]);
-        }
-        counters
-    }
-}
-
-fn counter(name: &'static str, value: &AtomicU64) -> Counter {
-    Counter {
-        name,
-        value: value.load(Relaxed),
-    }
-}
-
-fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(body)
-        .expect("failed to spawn a thread")
+/// Accepts IPv4 (as IPv4-mapped) and IPv6 connections on one port.
+fn dual_stack_listener() -> std::io::Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(SocketProtocol::TCP))?;
+    socket.set_only_v6(false)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 fn socket_loop(shared: &Shared, socket: &Handle, oracle: &dyn DecisionOracle) {
@@ -266,7 +204,10 @@ fn socket_loop(shared: &Shared, socket: &Handle, oracle: &dyn DecisionOracle) {
     loop {
         if let Err(code) = socket.recv(&mut [], &mut addr) {
             if code != ERROR_NO_DATA {
-                error!(code, "socket-layer receive failed; new connections are no longer proxied");
+                error!(
+                    code,
+                    "socket-layer receive failed; new connections are no longer proxied"
+                );
             }
             return;
         }
@@ -274,10 +215,14 @@ fn socket_loop(shared: &Shared, socket: &Handle, oracle: &dyn DecisionOracle) {
         match addr.event() {
             ffi::EVENT_SOCKET_CONNECT => on_connect(shared, oracle, &addr, &data),
             ffi::EVENT_SOCKET_CLOSE => {
-                if let Some(pending) = shared.tracker.on_close(data.local_port, addr.timestamp) {
-                    // The socket closed while its SYN was parked; drop the SYN.
-                    if let Some(parker) = &shared.parker {
-                        parker.free(pending.index());
+                // A CLOSE does not tell the address family; each table checks
+                // whether the CLOSE belongs to its flow on this port.
+                for tracker in shared.trackers.iter() {
+                    if let Some(pending) = tracker.on_close(data.local_port, addr.timestamp) {
+                        // The socket closed while its SYN was parked; drop it.
+                        if let Some(parker) = &shared.parker {
+                            parker.free(pending.index());
+                        }
                     }
                 }
             }
@@ -287,43 +232,34 @@ fn socket_loop(shared: &Shared, socket: &Handle, oracle: &dyn DecisionOracle) {
 }
 
 fn on_connect(shared: &Shared, oracle: &dyn DecisionOracle, addr: &Address, data: &SocketData) {
-    // IPv6 connections are not intercepted; the network filter lets their
-    // packets pass untouched.
-    let Some(remote_ip) = data.remote_ipv4() else {
-        return;
-    };
     let counters = &shared.counters;
-    counters.connects.fetch_add(1, Relaxed);
+    counters.tcp_connects.fetch_add(1, Relaxed);
     let port = data.local_port;
-    let remote = SocketAddr::from((remote_ip, data.remote_port));
-    if shared
-        .tracker
-        .is_echo(port, addr.timestamp, remote_ip, data.remote_port)
-    {
-        counters.echoes.fetch_add(1, Relaxed);
+    let remote_ip = data.remote_ip();
+    let remote = SocketAddr::new(remote_ip, data.remote_port);
+    let tracker = &shared.trackers[family(remote_ip)];
+    if data.process_id == 4 && tracker.is_echo(port, addr.timestamp, remote_ip, data.remote_port) {
+        counters.tcp_echoes.fetch_add(1, Relaxed);
         return;
     }
     let verdict = oracle.decide(&FlowQuery {
         pid: data.process_id,
         protocol: Protocol::Tcp,
-        remote,
+        remote: Some(remote),
     });
     let decision = match verdict {
-        Verdict::Proxy { group } => {
-            counters.proxied.fetch_add(1, Relaxed);
+        Verdict::Proxy { group, .. } => {
+            counters.tcp_proxied.fetch_add(1, Relaxed);
             debug!(pid = data.process_id, port, %remote, %group, "proxying TCP connection");
             Decision::Proxied { group: group.0 }
         }
         Verdict::Direct(reason) => {
-            counters.direct.fetch_add(1, Relaxed);
+            counters.tcp_direct.fetch_add(1, Relaxed);
             debug!(pid = data.process_id, port, %remote, reason = reason.as_str(), "direct TCP connection");
             Decision::Direct
         }
     };
-    match shared
-        .tracker
-        .publish(port, decision, remote_ip, data.remote_port, addr.timestamp)
-    {
+    match tracker.publish(port, decision, remote_ip, data.remote_port, addr.timestamp) {
         Publish::Stored => {}
         Publish::Released(pending) => {
             if let Some(parker) = &shared.parker {
@@ -331,8 +267,9 @@ fn on_connect(shared: &Shared, oracle: &dyn DecisionOracle, addr: &Address, data
             }
         }
         Publish::LateRejected => {
-            counters.late_rejected.fetch_add(1, Relaxed);
+            counters.tcp_late_rejected.fetch_add(1, Relaxed);
             if matches!(decision, Decision::Proxied { .. }) {
+                counters.tcp_proxy_late_rejected.fetch_add(1, Relaxed);
                 warn!(
                     pid = data.process_id,
                     port,
@@ -361,33 +298,42 @@ fn network_loop(shared: &Shared) {
     }
 }
 
-fn handle_packet(shared: &Shared, packet: &mut [u8], addr: &mut Address) {
-    let Some(tcp) = Ipv4Tcp::parse(packet) else {
-        return send_unchanged(shared, packet, addr);
+fn handle_packet(shared: &Shared, buffer: &mut [u8], addr: &mut Address) {
+    let Some(packet) = Packet::parse(buffer).filter(|p| p.protocol() == packet::TCP) else {
+        return send_unchanged(shared, buffer, addr);
     };
-    let (src_port, dst_port) = (tcp.src_port(), tcp.dst_port());
+    let family = usize::from(packet.is_ipv6());
+    let (src_port, dst_port) = (packet.src_port(), packet.dst_port());
+    let tracker = &shared.trackers[family];
     if src_port == shared.acceptor_port {
         // The acceptor answering a redirected connection.
-        return match shared.tracker.proxied_remote_port(dst_port) {
-            Some(original_port) => from_acceptor(shared, packet, addr, original_port),
-            None => send_unchanged(shared, packet, addr),
+        return match tracker.proxied_remote_port(dst_port) {
+            Some(original_port) => from_acceptor(shared, buffer, addr, original_port),
+            None => send_unchanged(shared, buffer, addr),
         };
     }
-    if tcp.is_initial_syn() {
-        let seq = tcp.seq();
-        return handle_syn(shared, packet, addr, src_port, seq);
+    if packet.is_initial_syn() {
+        let seq = packet.seq();
+        return handle_syn(shared, family, buffer, addr, src_port, seq);
     }
-    if shared.tracker.state(src_port) == SlotState::Proxied {
-        to_acceptor(shared, packet, addr);
+    if tracker.state(src_port) == SlotState::Proxied {
+        to_acceptor(shared, buffer, addr);
     } else {
-        send_unchanged(shared, packet, addr);
+        send_unchanged(shared, buffer, addr);
     }
 }
 
 /// The first packet of a connection. It must not leave before its flow has
 /// been decided, or a proxied flow would escape.
-fn handle_syn(shared: &Shared, packet: &mut [u8], addr: &mut Address, port: u16, seq: u32) {
-    let tracker = &shared.tracker;
+fn handle_syn(
+    shared: &Shared,
+    family: usize,
+    packet: &mut [u8],
+    addr: &mut Address,
+    port: u16,
+    seq: u32,
+) {
+    let tracker = &shared.trackers[family];
     let view = tracker.load(port);
     match view.word.state() {
         state @ (SlotState::Proxied | SlotState::Direct | SlotState::Abandoned) => {
@@ -415,13 +361,13 @@ fn handle_syn(shared: &Shared, packet: &mut [u8], addr: &mut Address, port: u16,
         tracker.pin_abandoned(port, view.word, addr.timestamp);
         return send_unchanged(shared, packet, addr);
     };
-    let Some((generation, index)) = parker.park(packet, addr, port) else {
-        shared.counters.park_failed.fetch_add(1, Relaxed);
+    let Some((generation, index)) = parker.park(packet, addr, family, port) else {
+        shared.counters.syn_park_failed.fetch_add(1, Relaxed);
         tracker.pin_abandoned(port, view.word, addr.timestamp);
         return send_unchanged(shared, packet, addr);
     };
     if tracker.try_park(port, view.word, generation, index, addr.timestamp) {
-        shared.counters.parked.fetch_add(1, Relaxed);
+        shared.counters.syn_parked.fetch_add(1, Relaxed);
         return;
     }
     // A decision landed between our read and the park: act on it now.
@@ -446,20 +392,20 @@ fn send_decided(shared: &Shared, packet: &mut [u8], addr: &mut Address, decision
 
 /// An outbound packet of a proxied flow becomes an inbound packet to the
 /// acceptor, coming from the original destination.
-fn to_acceptor(shared: &Shared, packet: &mut [u8], addr: &mut Address) {
-    let mut tcp = Ipv4Tcp::parse(packet).expect("packet was parsed before");
-    tcp.swap_addresses();
-    tcp.set_dst_port(shared.acceptor_port);
-    inject_inbound(shared, packet, addr);
+fn to_acceptor(shared: &Shared, buffer: &mut [u8], addr: &mut Address) {
+    let mut packet = Packet::parse(buffer).expect("packet was parsed before");
+    packet.swap_addresses();
+    packet.set_dst_port(shared.acceptor_port);
+    inject_inbound(shared, buffer, addr);
 }
 
 /// The acceptor's reply becomes an inbound packet to the application, coming
 /// from the original destination.
-fn from_acceptor(shared: &Shared, packet: &mut [u8], addr: &mut Address, original_port: u16) {
-    let mut tcp = Ipv4Tcp::parse(packet).expect("packet was parsed before");
-    tcp.swap_addresses();
-    tcp.set_src_port(original_port);
-    inject_inbound(shared, packet, addr);
+fn from_acceptor(shared: &Shared, buffer: &mut [u8], addr: &mut Address, original_port: u16) {
+    let mut packet = Packet::parse(buffer).expect("packet was parsed before");
+    packet.swap_addresses();
+    packet.set_src_port(original_port);
+    inject_inbound(shared, buffer, addr);
 }
 
 fn inject_inbound(shared: &Shared, packet: &mut [u8], addr: &mut Address) {
@@ -476,8 +422,8 @@ fn send_unchanged(shared: &Shared, packet: &[u8], addr: &Address) {
 
 fn accept_loop(
     listener: &TcpListener,
-    tracker: &Arc<PortTracker>,
-    handoff: &TcpHandoff,
+    trackers: &Arc<Trackers>,
+    handoff: &(dyn Fn(RedirectedTcp) + Send + Sync),
     stop: &AtomicBool,
     counters: &Counters,
 ) {
@@ -495,23 +441,27 @@ fn accept_loop(
         };
         // A redirected connection arrives from (original destination, the
         // application's local port). Anything else is not ours.
-        let Ok(SocketAddr::V4(peer)) = stream.peer_addr() else {
+        let Ok(peer) = stream.peer_addr() else {
             continue;
         };
-        let port = peer.port();
-        let Some(taken) = tracker.take(port).filter(|t| t.remote_ip == *peer.ip()) else {
-            counters.rejected_peers.fetch_add(1, Relaxed);
+        let (peer_ip, port) = (peer.ip().to_canonical(), peer.port());
+        let family = family(peer_ip);
+        let Some(taken) = trackers[family]
+            .take(port)
+            .filter(|t| t.remote_ip == peer_ip)
+        else {
+            counters.tcp_rejected_peers.fetch_add(1, Relaxed);
             debug!(%peer, "closed an unexpected connection to the redirect listener");
             continue;
         };
-        counters.accepted.fetch_add(1, Relaxed);
-        let lease_tracker = Arc::clone(tracker);
+        counters.tcp_accepted.fetch_add(1, Relaxed);
+        let lease_trackers = Arc::clone(trackers);
         handoff(RedirectedTcp {
             stream,
-            original_dst: SocketAddr::from((taken.remote_ip, taken.remote_port)),
+            original_dst: SocketAddr::new(taken.remote_ip, taken.remote_port),
             group: GroupId(taken.group),
             lease: FlowLease::new(move || {
-                lease_tracker.clear_if(port, taken.word);
+                lease_trackers[family].clear_if(port, taken.word);
             }),
         });
     }

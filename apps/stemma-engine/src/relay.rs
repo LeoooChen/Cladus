@@ -91,7 +91,12 @@ pub async fn relay(
     target: SocketAddr,
 ) -> Result<(u64, u64), RelayError> {
     let name = format!("{}:{}", proxy.host, proxy.port);
-    let mut upstream = match timeout(CONNECT_TIMEOUT, TcpStream::connect((proxy.host.as_str(), proxy.port))).await {
+    let mut upstream = match timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((proxy.host.as_str(), proxy.port)),
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => return Err(RelayError::Connect(name, err)),
         Err(_) => return Err(RelayError::Timeout(name)),
@@ -105,9 +110,11 @@ pub async fn relay(
     .await
     .map_err(|_| RelayError::Timeout(name))??;
     // Errors after the tunnel is up are ordinary disconnects.
-    Ok(copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
-        .await
-        .unwrap_or_default())
+    Ok(
+        copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -132,7 +139,10 @@ mod tests {
                 [request[4], request[5], request[6], request[7]],
                 u16::from_be_bytes([request[8], request[9]]),
             ));
-            stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
             let (mut read, mut write) = stream.split();
             tokio::io::copy(&mut read, &mut write).await.unwrap();
             target
@@ -144,7 +154,9 @@ mod tests {
     async fn relays_both_directions_through_the_proxy() {
         let (proxy_port, server) = echo_proxy().await;
         let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut app = TcpStream::connect(local.local_addr().unwrap()).await.unwrap();
+        let mut app = TcpStream::connect(local.local_addr().unwrap())
+            .await
+            .unwrap();
         let (redirected, _) = local.accept().await.unwrap();
         let proxy = ProxyEndpoint {
             host: "127.0.0.1".to_owned(),
@@ -170,7 +182,9 @@ mod tests {
         let port = unused.local_addr().unwrap().port();
         drop(unused);
         let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _app = TcpStream::connect(local.local_addr().unwrap()).await.unwrap();
+        let _app = TcpStream::connect(local.local_addr().unwrap())
+            .await
+            .unwrap();
         let (redirected, _) = local.accept().await.unwrap();
         let proxy = ProxyEndpoint {
             host: "127.0.0.1".to_owned(),

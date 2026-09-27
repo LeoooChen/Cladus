@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "proxy_groups": [
+    {
+      "id": 0,
+      "name": "local",
+      "host": "127.0.0.1",
+      "port": 7890
+    }
+  ],
+  "rules": [
+    {
+      "id": "antigravity",
+      "name": "Antigravity and descendants",
+      "enabled": true,
+      "process_name": "Antigravity.exe",
+      "protocol": "both",
+      "proxy_group_id": 0
+    }
+  ]
+}

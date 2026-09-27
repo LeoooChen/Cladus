@@ -11,5 +11,6 @@ pub mod decision;
 pub mod matching;
 pub mod model;
 pub mod platform;
+pub mod policy;
 pub mod rules;
 pub mod tree;

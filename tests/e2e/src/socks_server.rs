@@ -3,7 +3,7 @@
 //! requested target.
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -12,27 +12,38 @@ pub struct TestServer {
     pub addr: SocketAddr,
     /// Targets of the CONNECT requests answered so far.
     pub targets: Arc<Mutex<Vec<String>>>,
+    pub udp_targets: Arc<Mutex<Vec<String>>>,
 }
 
 pub fn start(listen: SocketAddr, marker: &str) -> io::Result<TestServer> {
     let listener = TcpListener::bind(listen)?;
     let addr = listener.local_addr()?;
     let targets = Arc::new(Mutex::new(Vec::new()));
+    let udp_targets = Arc::new(Mutex::new(Vec::new()));
+    let udp_seen = Arc::clone(&udp_targets);
     let (seen, marker) = (Arc::clone(&targets), marker.to_owned());
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let (seen, marker) = (Arc::clone(&seen), marker.clone());
+            let udp_seen = Arc::clone(&udp_seen);
             thread::spawn(move || {
-                if let Ok(target) = serve(stream, &marker) {
-                    seen.lock().unwrap().push(target);
-                }
+                let _ = serve(stream, &marker, &seen, &udp_seen);
             });
         }
     });
-    Ok(TestServer { addr, targets })
+    Ok(TestServer {
+        addr,
+        targets,
+        udp_targets,
+    })
 }
 
-fn serve(mut stream: TcpStream, marker: &str) -> io::Result<String> {
+fn serve(
+    mut stream: TcpStream,
+    marker: &str,
+    seen: &Mutex<Vec<String>>,
+    udp_seen: &Mutex<Vec<String>>,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut head = [0u8; 2];
     stream.read_exact(&mut head)?;
@@ -65,16 +76,75 @@ fn serve(mut stream: TcpStream, marker: &str) -> io::Result<String> {
     let mut port = [0u8; 2];
     stream.read_exact(&mut port)?;
     let target = format!("{host}:{}", u16::from_be_bytes(port));
+    if request[1] == 3 {
+        return serve_udp(stream, marker, udp_seen);
+    }
+    if request[1] != 1 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
     stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])?;
 
     // Read the client's request, then answer and close.
     let mut buffer = [0u8; 1024];
     let _ = stream.read(&mut buffer)?;
     let body = format!("{marker} {target}");
+    seen.lock().unwrap().push(target);
     write!(
         stream,
         "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
-    Ok(target)
+    Ok(())
+}
+
+fn serve_udp(mut control: TcpStream, marker: &str, seen: &Mutex<Vec<String>>) -> io::Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let port = socket.local_addr()?.port().to_be_bytes();
+    control.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]])?;
+    control.set_nonblocking(true)?;
+    let mut buffer = vec![0u8; 65_536];
+    loop {
+        match control.peek(&mut [0u8; 1]) {
+            Ok(0) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+            _ => {}
+        }
+        let (len, client) = match socket.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if len < 4 || buffer[..3] != [0, 0, 0] {
+            continue;
+        }
+        let (host, header) = match buffer[3] {
+            1 if len >= 10 => (
+                Ipv4Addr::from(<[u8; 4]>::try_from(&buffer[4..8]).unwrap()).to_string(),
+                10,
+            ),
+            4 if len >= 22 => (
+                format!(
+                    "[{}]",
+                    Ipv6Addr::from(<[u8; 16]>::try_from(&buffer[4..20]).unwrap())
+                ),
+                22,
+            ),
+            _ => continue,
+        };
+        let port = u16::from_be_bytes([buffer[header - 2], buffer[header - 1]]);
+        let target = format!("{host}:{port}");
+        seen.lock().unwrap().push(target.clone());
+        let mut response = buffer[..header].to_vec();
+        response.extend(format!("{marker} {target} {}", len - header).bytes());
+        socket.send_to(&response, client)?;
+    }
 }

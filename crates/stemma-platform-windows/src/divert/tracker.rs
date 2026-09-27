@@ -22,7 +22,7 @@
 //! Timestamps are WinDivert kernel timestamps (QueryPerformanceCounter
 //! ticks), the same clock at the socket and network layers.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
 
@@ -106,7 +106,7 @@ pub struct SlotView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Taken {
     pub word: Word,
-    pub remote_ip: Ipv4Addr,
+    pub remote_ip: IpAddr,
     pub remote_port: u16,
     pub group: u32,
 }
@@ -119,11 +119,30 @@ struct Slot {
     connect_ts: AtomicI64,
     /// Timestamp of the SYN that was parked or sent on while undecided.
     syn_ts: AtomicI64,
-    remote_ip: AtomicU32,
+    /// Remote IPv6 address (IPv4 stored IPv4-mapped), high and low halves.
+    remote_ip: [AtomicU64; 2],
     remote_port: AtomicU32,
     group: AtomicU32,
     /// Initial sequence number of the last SYN handled on this port.
     syn_seq: AtomicU32,
+}
+
+impl Slot {
+    fn store_remote(&self, ip: IpAddr) {
+        let bits = match ip {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+            IpAddr::V6(v6) => v6,
+        }
+        .to_bits();
+        self.remote_ip[0].store((bits >> 64) as u64, Relaxed);
+        self.remote_ip[1].store(bits as u64, Relaxed);
+    }
+
+    fn remote(&self) -> IpAddr {
+        let bits = u128::from(self.remote_ip[0].load(Relaxed)) << 64
+            | u128::from(self.remote_ip[1].load(Relaxed));
+        Ipv6Addr::from_bits(bits).to_canonical()
+    }
 }
 
 pub struct PortTracker {
@@ -187,7 +206,14 @@ impl PortTracker {
         self.slot(port).syn_seq.load(Relaxed) == seq
     }
 
-    pub fn try_park(&self, port: u16, expected: Word, generation: u32, index: u32, syn_ts: i64) -> bool {
+    pub fn try_park(
+        &self,
+        port: u16,
+        expected: Word,
+        generation: u32,
+        index: u32,
+        syn_ts: i64,
+    ) -> bool {
         let slot = self.slot(port);
         slot.syn_ts.store(syn_ts, Relaxed);
         let pending = Word::new(SlotState::Pending, generation, index);
@@ -211,12 +237,12 @@ impl PortTracker {
     /// Re-injecting a parked SYN makes the socket layer report a second
     /// CONNECT for the same flow. It carries the same remote endpoint and
     /// arrives within the TTL of the decision.
-    pub fn is_echo(&self, port: u16, connect_ts: i64, remote_ip: Ipv4Addr, remote_port: u16) -> bool {
+    pub fn is_echo(&self, port: u16, connect_ts: i64, remote_ip: IpAddr, remote_port: u16) -> bool {
         let slot = self.slot(port);
         let state = Word(slot.word.load(Acquire)).state();
         matches!(state, SlotState::Proxied | SlotState::Direct)
             && connect_ts - slot.connect_ts.load(Relaxed) <= self.ttl
-            && slot.remote_ip.load(Relaxed) == u32::from(remote_ip)
+            && slot.remote() == remote_ip
             && slot.remote_port.load(Relaxed) == u32::from(remote_port)
     }
 
@@ -225,7 +251,7 @@ impl PortTracker {
         &self,
         port: u16,
         decision: Decision,
-        remote_ip: Ipv4Addr,
+        remote_ip: IpAddr,
         remote_port: u16,
         connect_ts: i64,
     ) -> Publish {
@@ -242,7 +268,7 @@ impl PortTracker {
                 return Publish::LateRejected;
             }
             slot.connect_ts.store(connect_ts, Relaxed);
-            slot.remote_ip.store(u32::from(remote_ip), Relaxed);
+            slot.store_remote(remote_ip);
             slot.remote_port.store(u32::from(remote_port), Relaxed);
             slot.group.store(group, Relaxed);
             let decided = Word::new(state, self.next_tag(), NO_INDEX);
@@ -294,7 +320,7 @@ impl PortTracker {
         let word = Word(slot.word.load(Acquire));
         (word.state() == SlotState::Proxied).then(|| Taken {
             word,
-            remote_ip: Ipv4Addr::from(slot.remote_ip.load(Relaxed)),
+            remote_ip: slot.remote(),
             remote_port: slot.remote_port.load(Relaxed) as u16,
             group: slot.group.load(Relaxed),
         })
@@ -311,10 +337,12 @@ impl PortTracker {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     const TTL: i64 = 100;
-    const IP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+    const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
     const PROXY: Decision = Decision::Proxied { group: 7 };
 
     #[test]
@@ -331,9 +359,15 @@ mod tests {
         let t = PortTracker::new(TTL);
         assert_eq!(t.publish(5000, PROXY, IP, 443, 10), Publish::Stored);
         let taken = t.take(5000).unwrap();
-        assert_eq!((taken.remote_ip, taken.remote_port, taken.group), (IP, 443, 7));
+        assert_eq!(
+            (taken.remote_ip, taken.remote_port, taken.group),
+            (IP, 443, 7)
+        );
         assert_eq!(t.proxied_remote_port(5000), Some(443));
-        assert_eq!(t.publish(5001, Decision::Direct, IP, 443, 10), Publish::Stored);
+        assert_eq!(
+            t.publish(5001, Decision::Direct, IP, 443, 10),
+            Publish::Stored
+        );
         assert_eq!(t.take(5001), None);
     }
 
@@ -390,7 +424,11 @@ mod tests {
         assert_eq!(t.state(2), SlotState::Proxied);
 
         assert!(t.try_park(3, Word::EMPTY, 4, 8, 20));
-        assert_eq!(t.on_close(3, 10), None, "close of a flow before the parked SYN");
+        assert_eq!(
+            t.on_close(3, 10),
+            None,
+            "close of a flow before the parked SYN"
+        );
         let word = t.on_close(3, 30).unwrap();
         assert_eq!((word.generation(), word.index()), (4, 8));
         assert_eq!(t.state(3), SlotState::Empty);
@@ -408,6 +446,16 @@ mod tests {
         let second = t.take(5000).unwrap().word;
         assert!(t.clear_if(5000, second));
         assert_eq!(t.state(5000), SlotState::Empty);
+    }
+
+    #[test]
+    fn ipv6_remote_round_trips() {
+        let t = PortTracker::new(TTL);
+        let ip: IpAddr = "2001:db8::10".parse().unwrap();
+        t.publish(5000, PROXY, ip, 443, 10);
+        assert_eq!(t.take(5000).unwrap().remote_ip, ip);
+        assert!(t.is_echo(5000, 20, ip, 443));
+        assert!(!t.is_echo(5000, 20, IP, 443));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::ffi::CString;
 use std::mem::{size_of, transmute_copy};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ pub const LAYER_NETWORK: i32 = 0;
 pub const LAYER_SOCKET: i32 = 3;
 pub const FLAG_SNIFF: u64 = 0x1;
 pub const FLAG_RECV_ONLY: u64 = 0x4;
+pub const EVENT_SOCKET_BIND: u8 = 3;
 pub const EVENT_SOCKET_CONNECT: u8 = 4;
 pub const EVENT_SOCKET_CLOSE: u8 = 7;
 pub const PARAM_QUEUE_LENGTH: i32 = 0;
@@ -68,6 +69,21 @@ impl Address {
         self.bits & IPV6_BIT != 0
     }
 
+    /// Interface and sub-interface index of a network-layer packet.
+    pub fn interface(&self) -> (u32, u32) {
+        (self.data[0] as u32, (self.data[0] >> 32) as u32)
+    }
+
+    /// An address for injecting an inbound network-layer packet.
+    pub fn inbound(interface: (u32, u32), ipv6: bool) -> Self {
+        let mut addr = Self::zeroed();
+        addr.data[0] = u64::from(interface.0) | u64::from(interface.1) << 32;
+        if ipv6 {
+            addr.bits |= IPV6_BIT;
+        }
+        addr
+    }
+
     pub fn set_outbound(&mut self, outbound: bool) {
         if outbound {
             self.bits |= OUTBOUND_BIT;
@@ -102,12 +118,9 @@ pub struct SocketData {
 const _: () = assert!(size_of::<SocketData>() <= 64);
 
 impl SocketData {
-    /// The remote address, if it is an IPv4 address.
-    pub fn remote_ipv4(&self) -> Option<Ipv4Addr> {
-        match self.remote_addr {
-            [v4, 0xFFFF, 0, 0] => Some(Ipv4Addr::from(v4)),
-            _ => None,
-        }
+    pub fn remote_ip(&self) -> IpAddr {
+        let [a, b, c, d] = self.remote_addr.map(u128::from);
+        Ipv6Addr::from_bits(a | b << 32 | c << 64 | d << 96).to_canonical()
     }
 }
 
@@ -220,7 +233,10 @@ impl Handle {
         // SAFETY: `filter_c` is NUL-terminated.
         let raw = unsafe { (api.open)(filter_c.as_ptr().cast(), layer, priority, flags) };
         if raw == INVALID_HANDLE_VALUE {
-            return Err(os_error(format!("WinDivertOpen(\"{filter}\")"), last_error()));
+            return Err(os_error(
+                format!("WinDivertOpen(\"{filter}\")"),
+                last_error(),
+            ));
         }
         Ok(Self {
             api: Arc::clone(api),
@@ -253,7 +269,13 @@ impl Handle {
     pub fn send(&self, packet: &[u8], addr: &Address) -> Result<(), u32> {
         // SAFETY: `packet` is a readable buffer of the given length.
         let ok = unsafe {
-            (self.api.send)(self.raw, packet.as_ptr(), packet.len() as u32, null_mut(), addr)
+            (self.api.send)(
+                self.raw,
+                packet.as_ptr(),
+                packet.len() as u32,
+                null_mut(),
+                addr,
+            )
         };
         if ok != 0 { Ok(()) } else { Err(last_error()) }
     }
@@ -303,10 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_mapped_remote_address() {
+    fn remote_addresses() {
         // As reported for a connection to 203.0.113.9.
         let data = socket([0xCB00_7109, 0xFFFF, 0, 0]);
-        assert_eq!(data.remote_ipv4(), Some(Ipv4Addr::new(203, 0, 113, 9)));
-        assert_eq!(socket([1, 0, 0, 0x2001_0DB8]).remote_ipv4(), None);
+        assert_eq!(data.remote_ip(), "203.0.113.9".parse::<IpAddr>().unwrap());
+        let data = socket([1, 0, 0, 0x2001_0DB8]);
+        assert_eq!(data.remote_ip(), "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn inbound_address_carries_the_interface() {
+        let addr = Address::inbound((7, 3), true);
+        assert_eq!(addr.interface(), (7, 3));
+        assert!(addr.is_ipv6());
     }
 }

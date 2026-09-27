@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/stemma-core",
     "crates/stemma-platform-windows",
+    "crates/stemma-ipc",
     "apps/stemma-engine",
     "tests/e2e",
 ]
@@ -16,20 +17,24 @@ authors = ["Stemma contributors"]
 publish = false
 
 [workspace.dependencies]
-stemma-core = { path = "crates/stemma-core" }
-stemma-platform-windows = { path = "crates/stemma-platform-windows" }
+stemma-core = { version = "0.1.0", path = "crates/stemma-core" }
+stemma-platform-windows = { version = "0.1.0", path = "crates/stemma-platform-windows" }
+stemma-ipc = { version = "0.1.0", path = "crates/stemma-ipc" }
 
 anyhow = "1.0.100"
+arc-swap = "1.7"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 ipnet = "2.11"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+socket2 = "0.6"
 thiserror = "2.0"
 tokio = { version = "1.47", default-features = false }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt", "std", "ansi"] }
 windows-sys = "0.61"
+windows-service = "0.8"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

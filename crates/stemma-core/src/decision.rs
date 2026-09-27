@@ -1,15 +1,20 @@
 //! The decision core: owns the process tree and answers connection queries.
 
-use std::net::IpAddr;
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::debug;
 
-use crate::config::{Cidr, Config};
+use crate::config::{Config, RuleProtocol};
 use crate::matching::{fold, fold_path};
-use crate::model::{Assignment, DirectReason, FlowQuery, ParentRef, ProcessInfo, Verdict};
+use crate::model::{
+    Assignment, DirectReason, FlowQuery, GroupId, ParentRef, ProcessInfo, ProcessKey, ProcessView,
+    ProxyView, Source, Verdict,
+};
 use crate::platform::{ProcessEvent, ProcessInspector};
-use crate::rules::RuleSet;
+use crate::policy::{GLOBAL_POLICY, PolicyTable};
+use crate::rules::{PolicyIds, RuleSet};
 use crate::tree::{Lazy, NodeId, ProcessTree};
 
 /// How many processes one synchronous lineage lookup may insert.
@@ -31,24 +36,67 @@ pub struct CoreStats {
 pub struct DecisionCore {
     tree: ProcessTree,
     rules: RuleSet,
-    global_excludes: Vec<Cidr>,
+    policy_ids: PolicyIds,
+    policies: Arc<PolicyTable>,
     self_pid: u32,
     stats: CoreStats,
+    ancestry_retries: HashSet<ProcessKey>,
 }
 
 impl DecisionCore {
     pub fn new(config: &Config, self_pid: u32) -> Self {
+        let mut policy_ids = PolicyIds::default();
+        let rules = RuleSet::compile(config, &mut policy_ids);
+        let policies = Arc::new(rules.policies(config));
         Self {
             tree: ProcessTree::new(),
-            rules: RuleSet::compile(config),
-            global_excludes: config.global_exclude_cidrs.clone(),
+            rules,
+            policy_ids,
+            policies,
             self_pid,
             stats: CoreStats::default(),
+            ancestry_retries: HashSet::new(),
         }
+    }
+
+    /// Applies new rules and exclusions to every known process.
+    pub fn reconfigure(&mut self, config: &Config, inspector: &dyn ProcessInspector) {
+        self.rules = RuleSet::compile(config, &mut self.policy_ids);
+        self.policies = Arc::new(self.rules.policies(config));
+        for id in self.tree.all() {
+            self.assign(id, inspector);
+        }
+    }
+
+    /// Destination policies of the current rules.
+    pub fn policies(&self) -> Arc<PolicyTable> {
+        Arc::clone(&self.policies)
     }
 
     pub fn tree(&self) -> &ProcessTree {
         &self.tree
+    }
+
+    /// A missing ancestor may still be in the platform's event buffer.
+    pub fn has_unresolved_ancestry(&self, pid: u32) -> bool {
+        self.unresolved_ancestor(pid).is_some()
+    }
+
+    pub fn take_ancestry_retry(&mut self, pid: u32) -> bool {
+        self.unresolved_ancestor(pid)
+            .is_some_and(|key| self.ancestry_retries.insert(key))
+    }
+
+    fn unresolved_ancestor(&self, pid: u32) -> Option<ProcessKey> {
+        let mut id = self.tree.find_alive(pid)?;
+        while let Some(parent) = self.tree.node(id).parent {
+            id = parent;
+        }
+        let node = self.tree.node(id);
+        node.info
+            .parent
+            .is_some_and(|p| p.pid != node.info.key.pid)
+            .then_some(node.info.key)
     }
 
     pub fn stats(&self) -> CoreStats {
@@ -77,6 +125,8 @@ impl DecisionCore {
     /// Housekeeping; call about once a second.
     pub fn tick(&mut self, now: Instant) {
         self.tree.prune(now);
+        self.ancestry_retries
+            .retain(|key| self.tree.find(*key).is_some());
     }
 
     pub fn decide(
@@ -98,13 +148,91 @@ impl DecisionCore {
         if !assignment.protocol.includes(query.protocol) {
             return Verdict::Direct(DirectReason::ProtocolNotSelected);
         }
-        let ip = canonical_ip(query.remote.ip());
-        if ip.is_loopback() || self.global_excludes.iter().any(|c| c.contains(ip)) {
-            return Verdict::Direct(DirectReason::ExcludedDestination);
+        if let Some(remote) = query.remote
+            && let Err(reason) = self.policies.check(assignment.policy, remote)
+        {
+            return Verdict::Direct(reason);
         }
         Verdict::Proxy {
             group: assignment.group,
+            policy: assignment.policy,
         }
+    }
+
+    /// Proxies a running process and all of its descendants, present and
+    /// future, through `group` (or removes that choice with `None`). Returns
+    /// false if the process is not running.
+    pub fn set_manual(
+        &mut self,
+        pid: u32,
+        group: Option<GroupId>,
+        inspector: &dyn ProcessInspector,
+        now: Instant,
+    ) -> bool {
+        let Some(id) = self.resolve_alive(pid, inspector, now) else {
+            return false;
+        };
+        if group.is_some() {
+            self.tree.node_mut(id).manual = group;
+        } else {
+            // Clearing applies to the whole subtree, so a descendant chosen
+            // separately does not stay proxied behind the user's back.
+            for node in self.tree.subtree(id) {
+                self.tree.node_mut(node).manual = None;
+            }
+        }
+        self.reassign_subtree(id, inspector);
+        true
+    }
+
+    /// Excludes a running process and its descendants from a rule, or
+    /// includes them again. Returns false if the process is not running.
+    pub fn set_excluded(
+        &mut self,
+        pid: u32,
+        rule_id: &str,
+        excluded: bool,
+        inspector: &dyn ProcessInspector,
+        now: Instant,
+    ) -> bool {
+        let Some(id) = self.resolve_alive(pid, inspector, now) else {
+            return false;
+        };
+        let rules = &mut self.tree.node_mut(id).excluded_rules;
+        rules.retain(|r| r != rule_id);
+        if excluded {
+            rules.push(rule_id.to_owned());
+        }
+        self.reassign_subtree(id, inspector);
+        true
+    }
+
+    /// Every known process, parents before children.
+    pub fn snapshot(&self) -> Vec<ProcessView> {
+        self.tree
+            .all()
+            .into_iter()
+            .map(|id| {
+                let node = self.tree.node(id);
+                ProcessView {
+                    pid: node.info.key.pid,
+                    instance: node.info.key.instance,
+                    parent_pid: node.parent.map(|p| self.tree.node(p).info.key.pid),
+                    name: node.info.name.clone(),
+                    alive: node.alive,
+                    proxy: node.assignment.map(|a| ProxyView {
+                        rule_id: match a.source {
+                            Source::Manual => None,
+                            Source::Rule(index) => Some(self.rules.get(index).id.clone()),
+                        },
+                        inherited: a.inherited,
+                        group: a.group,
+                        protocol: a.protocol,
+                    }),
+                    excluded_rules: node.excluded_rules.clone(),
+                }
+            })
+            .collect()
     }
 
     /// The tree node of the process that owns `pid` right now.
@@ -193,55 +321,93 @@ impl DecisionCore {
         };
         self.assign(inserted.id, inspector);
         for child in inserted.adopted {
-            for id in self.tree.subtree(child) {
-                self.assign(id, inspector);
-            }
+            self.reassign_subtree(child, inspector);
         }
     }
 
-    /// Computes which rule covers `id`. Its parent must be up to date.
-    ///
-    /// Rules are tried in order; a rule covers the process if it matches the
-    /// process itself or covers its parent. The first such rule wins.
-    fn assign(&mut self, id: NodeId, inspector: &dyn ProcessInspector) {
-        let inherited = self
-            .tree
-            .node(id)
-            .parent
-            .and_then(|parent| self.tree.node(parent).assignment)
-            .map(|a| a.rule);
-        let mut found = None;
-        for index in 0..self.rules.len() {
-            if inherited == Some(index) {
-                found = Some((index, true));
-                break;
-            }
-            if self.matches(index, id, inspector) {
-                found = Some((index, false));
-                break;
-            }
+    fn reassign_subtree(&mut self, id: NodeId, inspector: &dyn ProcessInspector) {
+        for node in self.tree.subtree(id) {
+            self.assign(node, inspector);
         }
-        let assignment = found.map(|(rule, inherited)| {
-            let compiled = self.rules.get(rule);
-            Assignment {
-                rule,
-                inherited,
-                group: compiled.group,
-                protocol: compiled.protocol,
+    }
+
+    /// Computes how `id` is proxied. Its parent must be up to date.
+    ///
+    /// A manual choice on the process or an ancestor wins. Otherwise rules
+    /// are tried in order; a rule covers the process if it matches the
+    /// process itself or covers its parent, unless the process or an
+    /// ancestor was excluded from it. The first such rule wins.
+    fn assign(&mut self, id: NodeId, inspector: &dyn ProcessInspector) {
+        let node = self.tree.node(id);
+        let parent = node.parent.and_then(|p| self.tree.node(p).assignment);
+        let assignment = if let Some(group) = node.manual {
+            Some(manual(group))
+        } else if let Some(
+            inherited @ Assignment {
+                source: Source::Manual,
+                ..
+            },
+        ) = parent
+        {
+            Some(Assignment {
+                inherited: true,
+                ..inherited
+            })
+        } else {
+            let inherited_rule = parent.map(|a| a.source);
+            let mut found = None;
+            for index in 0..self.rules.len() {
+                if self.is_excluded(id, &self.rules.get(index).id) {
+                    continue;
+                }
+                if inherited_rule == Some(Source::Rule(index)) {
+                    found = Some((index, true));
+                    break;
+                }
+                if self.matches(index, id, inspector) {
+                    found = Some((index, false));
+                    break;
+                }
             }
-        });
+            found.map(|(index, inherited)| {
+                let rule = self.rules.get(index);
+                Assignment {
+                    source: Source::Rule(index),
+                    inherited,
+                    group: rule.group,
+                    protocol: rule.protocol,
+                    policy: rule.policy,
+                }
+            })
+        };
         let node = self.tree.node_mut(id);
-        if let Some(a) = assignment {
+        if assignment != node.assignment
+            && let Some(a) = assignment
+        {
             debug!(
                 pid = node.info.key.pid,
                 name = %node.info.name,
-                rule = %self.rules.get(a.rule).id,
+                source = ?a.source,
                 inherited = a.inherited,
                 group = %a.group,
-                "process covered by rule"
+                "process proxied"
             );
         }
         node.assignment = assignment;
+    }
+
+    /// Whether `id` or one of its ancestors was excluded from `rule_id`.
+    fn is_excluded(&self, mut id: NodeId, rule_id: &str) -> bool {
+        loop {
+            let node = self.tree.node(id);
+            if node.excluded_rules.iter().any(|r| r == rule_id) {
+                return true;
+            }
+            match node.parent {
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
     }
 
     fn matches(&mut self, index: usize, id: NodeId, inspector: &dyn ProcessInspector) -> bool {
@@ -271,13 +437,19 @@ impl DecisionCore {
     }
 }
 
+fn manual(group: GroupId) -> Assignment {
+    Assignment {
+        source: Source::Manual,
+        inherited: false,
+        group,
+        protocol: RuleProtocol::Both,
+        policy: GLOBAL_POLICY,
+    }
+}
+
 /// Returns the cached attribute, reading it once if needed. Exited processes
 /// can no longer be read.
-fn read_lazy(
-    slot: &mut Lazy,
-    alive: bool,
-    read: impl FnOnce() -> Option<String>,
-) -> Option<&str> {
+fn read_lazy(slot: &mut Lazy, alive: bool, read: impl FnOnce() -> Option<String>) -> Option<&str> {
     if *slot == Lazy::Unread {
         *slot = match alive.then(read).flatten() {
             Some(value) => Lazy::Value(value),
@@ -290,14 +462,6 @@ fn read_lazy(
     }
 }
 
-/// IPv4-mapped IPv6 addresses are treated as the IPv4 address they carry.
-fn canonical_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -305,9 +469,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::config::{ProxyGroup, Rule, RuleProtocol};
-    use crate::model::{GroupId, ProcessKey, Protocol};
+    use crate::config::{DestinationFilter, ProxyGroup, Rule};
+    use crate::model::{ProcessKey, Protocol};
     use crate::platform::ProcessDescription;
+    use crate::policy::PolicyId;
     use crate::tree::tests::{key, process};
 
     const SELF_PID: u32 = 4242;
@@ -377,7 +542,7 @@ mod tests {
         }
     }
 
-    fn core_with(rules: Vec<Rule>) -> DecisionCore {
+    fn config_with(rules: Vec<Rule>) -> Config {
         let config = Config {
             proxy_groups: vec![
                 ProxyGroup::default(),
@@ -390,7 +555,11 @@ mod tests {
             ..Config::default()
         };
         config.validate().unwrap();
-        DecisionCore::new(&config, SELF_PID)
+        config
+    }
+
+    fn core_with(rules: Vec<Rule>) -> DecisionCore {
+        DecisionCore::new(&config_with(rules), SELF_PID)
     }
 
     fn tcp(pid: u32) -> FlowQuery {
@@ -401,7 +570,7 @@ mod tests {
         FlowQuery {
             pid,
             protocol: Protocol::Tcp,
-            remote: remote.parse::<SocketAddr>().unwrap(),
+            remote: Some(remote.parse::<SocketAddr>().unwrap()),
         }
     }
 
@@ -413,10 +582,16 @@ mod tests {
         core.decide(&query, os, Instant::now())
     }
 
-    fn proxy(group: u32) -> Verdict {
-        Verdict::Proxy {
-            group: GroupId(group),
+    /// The group a query is proxied through, if any.
+    fn group_of(core: &mut DecisionCore, os: &FakeOs, query: FlowQuery) -> Option<u32> {
+        match decide(core, os, query) {
+            Verdict::Proxy { group, .. } => Some(group.0),
+            Verdict::Direct(_) => None,
         }
+    }
+
+    fn direct(reason: DirectReason) -> Verdict {
+        Verdict::Direct(reason)
     }
 
     #[test]
@@ -430,11 +605,18 @@ mod tests {
         started(&mut core, &os, process(1, 1, None, "bash.exe"));
         started(&mut core, &os, process(2, 2, Some((1, 1)), "curl.exe"));
         started(&mut core, &os, process(3, 3, Some((2, 2)), "helper.exe"));
-        started(&mut core, &os, process(4, 4, Some((3, 3)), "grandchild.exe"));
+        started(
+            &mut core,
+            &os,
+            process(4, 4, Some((3, 3)), "grandchild.exe"),
+        );
 
-        assert_eq!(decide(&mut core, &os, tcp(1)), Verdict::Direct(DirectReason::NotAssigned));
-        assert_eq!(decide(&mut core, &os, tcp(2)), proxy(0));
-        assert_eq!(decide(&mut core, &os, tcp(4)), proxy(0));
+        assert_eq!(
+            decide(&mut core, &os, tcp(1)),
+            direct(DirectReason::NotAssigned)
+        );
+        assert_eq!(group_of(&mut core, &os, tcp(2)), Some(0));
+        assert_eq!(group_of(&mut core, &os, tcp(4)), Some(0));
         let child = core.tree().find(key(3, 3)).unwrap();
         assert!(core.tree().node(child).assignment.unwrap().inherited);
     }
@@ -450,14 +632,20 @@ mod tests {
         ];
 
         // The helper's own rule comes first.
-        let mut core = core_with(vec![rule("helper", "helper.exe", 1), rule("curl", "curl.exe", 0)]);
+        let mut core = core_with(vec![
+            rule("helper", "helper.exe", 1),
+            rule("curl", "curl.exe", 0),
+        ]);
         tree.iter().for_each(|p| started(&mut core, &os, p.clone()));
-        assert_eq!(decide(&mut core, &os, tcp(3)), proxy(1));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(1));
 
         // The inherited rule comes first.
-        let mut core = core_with(vec![rule("curl", "curl.exe", 0), rule("helper", "helper.exe", 1)]);
+        let mut core = core_with(vec![
+            rule("curl", "curl.exe", 0),
+            rule("helper", "helper.exe", 1),
+        ]);
         tree.iter().for_each(|p| started(&mut core, &os, p.clone()));
-        assert_eq!(decide(&mut core, &os, tcp(3)), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
     }
 
     #[test]
@@ -471,21 +659,60 @@ mod tests {
         started(&mut core, &os, process(2, 2, None, "game.exe"));
         assert_eq!(
             decide(&mut core, &os, tcp(2)),
-            Verdict::Direct(DirectReason::ProtocolNotSelected)
+            direct(DirectReason::ProtocolNotSelected)
         );
+        let udp = FlowQuery {
+            pid: 2,
+            protocol: Protocol::Udp,
+            remote: None,
+        };
+        assert_eq!(group_of(&mut core, &os, udp), Some(0));
     }
 
     #[test]
-    fn excluded_and_loopback_destinations_go_direct() {
+    fn excluded_and_local_destinations_go_direct() {
         let mut os = FakeOs::default();
         os.run(2, 2, 0, "curl.exe", "");
         let mut core = core_with(vec![rule("r", "curl.exe", 0)]);
         started(&mut core, &os, process(2, 2, None, "curl.exe"));
-        let excluded = Verdict::Direct(DirectReason::ExcludedDestination);
-        assert_eq!(decide(&mut core, &os, tcp_to(2, "192.168.1.1:80")), excluded);
-        assert_eq!(decide(&mut core, &os, tcp_to(2, "[::ffff:10.1.2.3]:80")), excluded);
+        let excluded = direct(DirectReason::ExcludedDestination);
+        assert_eq!(
+            decide(&mut core, &os, tcp_to(2, "192.168.1.1:80")),
+            excluded
+        );
+        assert_eq!(
+            decide(&mut core, &os, tcp_to(2, "[::ffff:10.1.2.3]:80")),
+            excluded
+        );
         assert_eq!(decide(&mut core, &os, tcp_to(2, "[::1]:80")), excluded);
-        assert_eq!(decide(&mut core, &os, tcp_to(2, "8.8.8.8:53")), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp_to(2, "8.8.8.8:53")), Some(0));
+    }
+
+    #[test]
+    fn rule_destination_filter_is_applied() {
+        let mut os = FakeOs::default();
+        os.run(2, 2, 0, "curl.exe", "");
+        let mut core = core_with(vec![Rule {
+            dst_filter: DestinationFilter {
+                include_ports: vec!["443".parse().unwrap()],
+                ..DestinationFilter::default()
+            },
+            ..rule("r", "curl.exe", 0)
+        }]);
+        started(&mut core, &os, process(2, 2, None, "curl.exe"));
+        assert_eq!(group_of(&mut core, &os, tcp_to(2, "8.8.8.8:443")), Some(0));
+        assert_eq!(
+            decide(&mut core, &os, tcp_to(2, "8.8.8.8:80")),
+            direct(DirectReason::FilteredByRule)
+        );
+        let Verdict::Proxy { policy, .. } = decide(&mut core, &os, tcp(2)) else {
+            panic!("expected proxy");
+        };
+        assert!(
+            core.policies()
+                .check(policy, "8.8.8.8:80".parse().unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -495,7 +722,7 @@ mod tests {
         let mut core = core_with(vec![rule("r", "*", 0)]);
         assert_eq!(
             decide(&mut core, &os, tcp(SELF_PID)),
-            Verdict::Direct(DirectReason::SelfProcess)
+            direct(DirectReason::SelfProcess)
         );
     }
 
@@ -508,15 +735,19 @@ mod tests {
         let mut core = core_with(vec![rule("r", "git.exe", 0)]);
         started(&mut core, &os, process(1, 1, None, "explorer.exe"));
 
-        assert_eq!(decide(&mut core, &os, tcp(11)), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp(11)), Some(0));
         assert_eq!(core.stats().sync_resolves, 1);
         assert_eq!(core.stats().processes, 3);
 
         // The start events that arrive later change nothing.
         started(&mut core, &os, process(10, 10, Some((1, 1)), "git.exe"));
-        started(&mut core, &os, process(11, 11, Some((10, 10)), "git-remote-https.exe"));
+        started(
+            &mut core,
+            &os,
+            process(11, 11, Some((10, 10)), "git-remote-https.exe"),
+        );
         assert_eq!(core.stats().processes, 3);
-        assert_eq!(decide(&mut core, &os, tcp(11)), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp(11)), Some(0));
     }
 
     #[test]
@@ -526,7 +757,10 @@ mod tests {
         started(&mut core, &os, process(20, 1, None, "curl.exe"));
         // curl exited and notepad got its PID; the exit event is still in flight.
         os.run(20, 2, 0, "notepad.exe", "");
-        assert_eq!(decide(&mut core, &os, tcp(20)), Verdict::Direct(DirectReason::NotAssigned));
+        assert_eq!(
+            decide(&mut core, &os, tcp(20)),
+            direct(DirectReason::NotAssigned)
+        );
         assert_eq!(core.stats().recycled_pids, 1);
     }
 
@@ -537,21 +771,33 @@ mod tests {
         // PID 31 was reused by a process started after the child.
         os.run(31, 200, 0, "curl.exe", "");
         let mut core = core_with(vec![rule("r", "curl.exe", 0)]);
-        assert_eq!(decide(&mut core, &os, tcp(30)), Verdict::Direct(DirectReason::NotAssigned));
+        assert_eq!(
+            decide(&mut core, &os, tcp(30)),
+            direct(DirectReason::NotAssigned)
+        );
     }
 
     #[test]
     fn unknown_process_goes_direct() {
         let os = FakeOs::default();
         let mut core = core_with(vec![rule("r", "*", 0)]);
-        assert_eq!(decide(&mut core, &os, tcp(99)), Verdict::Direct(DirectReason::UnknownProcess));
+        assert_eq!(
+            decide(&mut core, &os, tcp(99)),
+            direct(DirectReason::UnknownProcess)
+        );
         assert_eq!(core.stats().unknown_processes, 1);
     }
 
     #[test]
     fn command_line_is_read_once_and_only_when_needed() {
         let mut os = FakeOs::default();
-        os.run(5, 5, 0, "python.exe", r"python.exe C:\jobs\crawler.py --fast");
+        os.run(
+            5,
+            5,
+            0,
+            "python.exe",
+            r"python.exe C:\jobs\crawler.py --fast",
+        );
         os.run(6, 6, 0, "python.exe", "python.exe other.py");
         os.run(7, 7, 0, "node.exe", "node crawler.js");
         let mut core = core_with(vec![Rule {
@@ -561,10 +807,16 @@ mod tests {
         for (pid, name) in [(5, "python.exe"), (6, "python.exe"), (7, "node.exe")] {
             started(&mut core, &os, process(pid, u64::from(pid), None, name));
         }
-        assert_eq!(decide(&mut core, &os, tcp(5)), proxy(0));
-        assert_eq!(decide(&mut core, &os, tcp(5)), proxy(0));
-        assert_eq!(decide(&mut core, &os, tcp(6)), Verdict::Direct(DirectReason::NotAssigned));
-        assert_eq!(decide(&mut core, &os, tcp(7)), Verdict::Direct(DirectReason::NotAssigned));
+        assert_eq!(group_of(&mut core, &os, tcp(5)), Some(0));
+        assert_eq!(group_of(&mut core, &os, tcp(5)), Some(0));
+        assert_eq!(
+            decide(&mut core, &os, tcp(6)),
+            direct(DirectReason::NotAssigned)
+        );
+        assert_eq!(
+            decide(&mut core, &os, tcp(7)),
+            direct(DirectReason::NotAssigned)
+        );
         assert_eq!(os.cmdline_reads.load(Ordering::Relaxed), 2);
     }
 
@@ -583,7 +835,7 @@ mod tests {
             },
         ]);
         started(&mut core, &os, process(5, 5, None, "tool.exe"));
-        assert_eq!(decide(&mut core, &os, tcp(5)), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp(5)), Some(0));
     }
 
     #[test]
@@ -594,7 +846,7 @@ mod tests {
         let mut core = core_with(vec![rule("r", "curl.exe", 0)]);
         started(&mut core, &os, process(3, 3, Some((2, 2)), "helper.exe"));
         started(&mut core, &os, process(2, 2, None, "curl.exe"));
-        assert_eq!(decide(&mut core, &os, tcp(3)), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
     }
 
     #[test]
@@ -603,9 +855,153 @@ mod tests {
         os.run(3, 3, 2, "helper.exe", "");
         let mut core = core_with(vec![rule("r", "sh.exe", 0)]);
         let now = Instant::now();
-        core.apply_event(ProcessEvent::Started(process(2, 2, None, "sh.exe")), &os, now);
+        core.apply_event(
+            ProcessEvent::Started(process(2, 2, None, "sh.exe")),
+            &os,
+            now,
+        );
         core.apply_event(ProcessEvent::Exited(key(2, 2)), &os, now);
         started(&mut core, &os, process(3, 3, Some((2, 2)), "helper.exe"));
-        assert_eq!(decide(&mut core, &os, tcp(3)), proxy(0));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
+    }
+
+    #[test]
+    fn late_parent_event_repairs_a_synchronously_resolved_subtree() {
+        let mut os = FakeOs::default();
+        os.run(3, 3, 2, "helper.exe", "");
+        os.run(4, 4, 3, "worker.exe", "");
+        let mut core = core_with(vec![rule("r", "sh.exe", 0)]);
+        assert_eq!(group_of(&mut core, &os, tcp(4)), None);
+        assert!(core.has_unresolved_ancestry(4));
+        started(&mut core, &os, process(2, 2, None, "sh.exe"));
+        core.apply_event(ProcessEvent::Exited(key(2, 2)), &os, Instant::now());
+        assert_eq!(group_of(&mut core, &os, tcp(4)), Some(0));
+        assert!(!core.has_unresolved_ancestry(4));
+    }
+
+    /// bash (1) -> app (2) -> worker (3)
+    fn chain_os() -> (FakeOs, Vec<ProcessInfo>) {
+        let mut os = FakeOs::default();
+        os.run(1, 1, 0, "bash.exe", "");
+        os.run(2, 2, 1, "app.exe", "");
+        os.run(3, 3, 2, "worker.exe", "");
+        let tree = vec![
+            process(1, 1, None, "bash.exe"),
+            process(2, 2, Some((1, 1)), "app.exe"),
+            process(3, 3, Some((2, 2)), "worker.exe"),
+        ];
+        (os, tree)
+    }
+
+    #[test]
+    fn manual_choice_covers_descendants_and_overrides_rules() {
+        let (os, tree) = chain_os();
+        let mut core = core_with(vec![rule("r", "worker.exe", 0)]);
+        tree.into_iter().for_each(|p| started(&mut core, &os, p));
+        let now = Instant::now();
+
+        assert!(core.set_manual(2, Some(GroupId(1)), &os, now));
+        assert_eq!(group_of(&mut core, &os, tcp(2)), Some(1));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(1));
+        assert_eq!(
+            decide(&mut core, &os, tcp(1)),
+            direct(DirectReason::NotAssigned)
+        );
+        // A manual choice proxies both protocols, with global exclusions only.
+        let udp = FlowQuery {
+            pid: 3,
+            protocol: Protocol::Udp,
+            remote: None,
+        };
+        assert_eq!(
+            decide(&mut core, &os, udp),
+            Verdict::Proxy {
+                group: GroupId(1),
+                policy: GLOBAL_POLICY
+            }
+        );
+
+        // Future children inherit it too.
+        let mut os = os;
+        os.run(4, 4, 3, "late.exe", "");
+        started(&mut core, &os, process(4, 4, Some((3, 3)), "late.exe"));
+        assert_eq!(group_of(&mut core, &os, tcp(4)), Some(1));
+
+        // Clearing it restores the rules.
+        assert!(core.set_manual(2, None, &os, now));
+        assert_eq!(
+            decide(&mut core, &os, tcp(2)),
+            direct(DirectReason::NotAssigned)
+        );
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
+        assert!(!core.set_manual(99, Some(GroupId(0)), &os, now));
+    }
+
+    #[test]
+    fn excluded_subtree_falls_through_to_other_rules() {
+        let (os, tree) = chain_os();
+        let mut core = core_with(vec![
+            rule("app", "app.exe", 0),
+            rule("worker", "worker.exe", 1),
+        ]);
+        tree.into_iter().for_each(|p| started(&mut core, &os, p));
+        let now = Instant::now();
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
+
+        assert!(core.set_excluded(2, "app", true, &os, now));
+        assert_eq!(
+            decide(&mut core, &os, tcp(2)),
+            direct(DirectReason::NotAssigned)
+        );
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(1));
+
+        assert!(core.set_excluded(2, "app", false, &os, now));
+        assert_eq!(group_of(&mut core, &os, tcp(2)), Some(0));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
+    }
+
+    #[test]
+    fn reconfigure_applies_new_rules_to_running_processes() {
+        let (os, tree) = chain_os();
+        let mut core = core_with(vec![rule("r", "app.exe", 0)]);
+        tree.into_iter().for_each(|p| started(&mut core, &os, p));
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(0));
+        let Verdict::Proxy { policy: before, .. } = decide(&mut core, &os, tcp(3)) else {
+            panic!("expected proxy");
+        };
+
+        core.reconfigure(
+            &config_with(vec![rule("w", "worker.exe", 1), rule("r", "app.exe", 0)]),
+            &os,
+        );
+        assert_eq!(group_of(&mut core, &os, tcp(3)), Some(1));
+        assert_eq!(group_of(&mut core, &os, tcp(2)), Some(0));
+        let Verdict::Proxy { policy: after, .. } = decide(&mut core, &os, tcp(2)) else {
+            panic!("expected proxy");
+        };
+        assert_eq!(before, after, "a rule keeps its policy id across reloads");
+        assert_ne!(after, PolicyId(0));
+
+        core.reconfigure(&config_with(vec![]), &os);
+        assert_eq!(
+            decide(&mut core, &os, tcp(3)),
+            direct(DirectReason::NotAssigned)
+        );
+    }
+
+    #[test]
+    fn snapshot_shows_the_tree_and_why_processes_are_proxied() {
+        let (os, tree) = chain_os();
+        let mut core = core_with(vec![rule("r", "app.exe", 0)]);
+        tree.into_iter().for_each(|p| started(&mut core, &os, p));
+        core.set_excluded(3, "other", true, &os, Instant::now());
+        let views = core.snapshot();
+        assert_eq!(views.iter().map(|v| v.pid).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(views[0].proxy, None);
+        let app = views[1].proxy.as_ref().unwrap();
+        assert_eq!((app.rule_id.as_deref(), app.inherited), (Some("r"), false));
+        assert_eq!(views[2].parent_pid, Some(2));
+        assert!(views[2].proxy.as_ref().unwrap().inherited);
+        assert_eq!(views[2].excluded_rules, ["other"]);
     }
 }

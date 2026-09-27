@@ -23,17 +23,17 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     ENABLE_TRACE_PARAMETERS_VERSION_2, EVENT_CONTROL_CODE_CAPTURE_STATE,
     EVENT_CONTROL_CODE_DISABLE_PROVIDER, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_TYPE_EVENT_ID, EVENT_HEADER_FLAG_32_BIT_HEADER,
-    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, PropertyParamCount,
-    PropertyParamFixedCount, PropertyParamFixedLength, PropertyParamLength, PropertyStruct,
-    StartTraceW, TDH_INTYPE_ANSISTRING, TDH_INTYPE_BINARY, TDH_INTYPE_BOOLEAN,
-    TDH_INTYPE_DOUBLE, TDH_INTYPE_FILETIME, TDH_INTYPE_FLOAT, TDH_INTYPE_GUID,
-    TDH_INTYPE_HEXINT32, TDH_INTYPE_HEXINT64, TDH_INTYPE_INT8, TDH_INTYPE_INT16,
-    TDH_INTYPE_INT32, TDH_INTYPE_INT64, TDH_INTYPE_POINTER, TDH_INTYPE_SID,
-    TDH_INTYPE_SIZET, TDH_INTYPE_SYSTEMTIME, TDH_INTYPE_UINT8, TDH_INTYPE_UINT16,
-    TDH_INTYPE_UINT32, TDH_INTYPE_UINT64, TDH_INTYPE_UNICODESTRING, TRACE_EVENT_INFO,
-    TRACE_LEVEL_INFORMATION, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_FLUSH, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+    EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+    PROCESSTRACE_HANDLE, ProcessTrace, PropertyParamCount, PropertyParamFixedCount,
+    PropertyParamFixedLength, PropertyParamLength, PropertyStruct, StartTraceW,
+    TDH_INTYPE_ANSISTRING, TDH_INTYPE_BINARY, TDH_INTYPE_BOOLEAN, TDH_INTYPE_DOUBLE,
+    TDH_INTYPE_FILETIME, TDH_INTYPE_FLOAT, TDH_INTYPE_GUID, TDH_INTYPE_HEXINT32,
+    TDH_INTYPE_HEXINT64, TDH_INTYPE_INT8, TDH_INTYPE_INT16, TDH_INTYPE_INT32, TDH_INTYPE_INT64,
+    TDH_INTYPE_POINTER, TDH_INTYPE_SID, TDH_INTYPE_SIZET, TDH_INTYPE_SYSTEMTIME, TDH_INTYPE_UINT8,
+    TDH_INTYPE_UINT16, TDH_INTYPE_UINT32, TDH_INTYPE_UINT64, TDH_INTYPE_UNICODESTRING,
+    TRACE_EVENT_INFO, TRACE_LEVEL_INFORMATION, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
 };
 use windows_sys::core::GUID;
 
@@ -190,6 +190,23 @@ impl ProcessSource for EtwProcessSource {
         drop(unsafe { Box::from_raw(session.context) });
         info!("ETW process session stopped");
     }
+
+    fn flush(&self) {
+        let session = self.session.lock().unwrap();
+        if let Some(session) = session.as_ref() {
+            let mut properties = Properties::new();
+            // SAFETY: the control handle and properties buffer remain valid
+            // throughout this call; consumers process the flushed events.
+            unsafe {
+                ControlTraceW(
+                    session.control,
+                    null(),
+                    properties.as_mut_ptr(),
+                    EVENT_TRACE_CONTROL_FLUSH,
+                )
+            };
+        }
+    }
 }
 
 /// An EVENT_TRACE_PROPERTIES block followed by room for the session name.
@@ -205,7 +222,8 @@ impl Properties {
         properties.Wnode.BufferSize = total as u32;
         properties.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         properties.Wnode.ClientContext = 1; // QueryPerformanceCounter timestamps
-        properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        properties.LogFileMode =
+            EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
         properties.LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
         properties.BufferSize = 64;
         properties.MinimumBuffers = 4;
@@ -247,7 +265,12 @@ fn stop_session(control: CONTROLTRACE_HANDLE) {
             0,
             null(),
         );
-        ControlTraceW(control, null(), properties.as_mut_ptr(), EVENT_TRACE_CONTROL_STOP);
+        ControlTraceW(
+            control,
+            null(),
+            properties.as_mut_ptr(),
+            EVENT_TRACE_CONTROL_STOP,
+        );
     }
 }
 
@@ -452,8 +475,10 @@ impl Plan {
                 } else {
                     1
                 },
-                fixed_length: (flags & PropertyParamFixedLength != 0).then_some(usize::from(length)),
-                unsupported: flags & (PropertyStruct | PropertyParamCount | PropertyParamLength) != 0,
+                fixed_length: (flags & PropertyParamFixedLength != 0)
+                    .then_some(usize::from(length)),
+                unsupported: flags & (PropertyStruct | PropertyParamCount | PropertyParamLength)
+                    != 0,
                 wanted: match name.as_str() {
                     "ProcessID" => Some(Wanted::Pid),
                     "ProcessSequenceNumber" => Some(Wanted::Sequence),
@@ -484,8 +509,7 @@ impl Plan {
                 usize::from(record.UserDataLength),
             )
         };
-        let is_32_bit =
-            u32::from(record.EventHeader.Flags) & EVENT_HEADER_FLAG_32_BIT_HEADER != 0;
+        let is_32_bit = u32::from(record.EventHeader.Flags) & EVENT_HEADER_FLAG_32_BIT_HEADER != 0;
         let mut out = Fields::default();
         let mut offset = 0;
         for field in &self.fields {
@@ -538,7 +562,10 @@ fn field_size(in_type: i32, data: &[u8], is_32_bit: bool) -> Option<usize> {
             .iter()
             .position(|c| *c == [0, 0])
             .map_or(data.len(), |units| (units + 1) * 2),
-        TDH_INTYPE_ANSISTRING => data.iter().position(|&b| b == 0).map_or(data.len(), |n| n + 1),
+        TDH_INTYPE_ANSISTRING => data
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(data.len(), |n| n + 1),
         TDH_INTYPE_SID => 8 + 4 * usize::from(*data.get(1)?),
         _ => return None,
     })
@@ -585,7 +612,10 @@ mod tests {
     use super::*;
 
     fn utf16(s: &str) -> Vec<u8> {
-        s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+        s.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
     }
 
     #[test]
@@ -593,10 +623,19 @@ mod tests {
         let name = utf16("cmd.exe");
         let mut data = name.clone();
         data.extend([1, 2, 3]);
-        assert_eq!(field_size(TDH_INTYPE_UNICODESTRING, &data, false), Some(name.len()));
-        assert_eq!(field_size(TDH_INTYPE_ANSISTRING, b"abc\0xyz", false), Some(4));
+        assert_eq!(
+            field_size(TDH_INTYPE_UNICODESTRING, &data, false),
+            Some(name.len())
+        );
+        assert_eq!(
+            field_size(TDH_INTYPE_ANSISTRING, b"abc\0xyz", false),
+            Some(4)
+        );
         // A SID with two sub-authorities.
-        assert_eq!(field_size(TDH_INTYPE_SID, &[1, 2, 0, 0, 0, 0, 0, 5], false), Some(16));
+        assert_eq!(
+            field_size(TDH_INTYPE_SID, &[1, 2, 0, 0, 0, 0, 0, 5], false),
+            Some(16)
+        );
         assert_eq!(field_size(TDH_INTYPE_POINTER, &[], true), Some(4));
         assert_eq!(field_size(TDH_INTYPE_BOOLEAN, &[], false), Some(4));
         assert_eq!(field_size(TDH_INTYPE_BINARY, &[], false), None);

@@ -6,12 +6,13 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RuleProtocol;
+use crate::policy::PolicyId;
 
 /// Identity of a process that stays unique when the OS reuses its PID.
 ///
 /// `instance` tells apart processes that held the same PID at different
 /// times: the ProcessSequenceNumber on Windows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessKey {
     pub pid: u32,
     pub instance: u64,
@@ -47,7 +48,7 @@ pub struct ProcessInfo {
 }
 
 /// Identifier of a proxy group in the configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GroupId(pub u32);
 
@@ -63,30 +64,41 @@ pub enum Protocol {
     Udp,
 }
 
-/// Which rule covers a process, and whether it matched the process itself or
-/// one of its ancestors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Chosen by the user for this process or an ancestor.
+    Manual,
+    /// Index of the rule in the active rule set.
+    Rule(usize),
+}
+
+/// Why a process is proxied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Assignment {
-    /// Index of the rule in the active rule set.
-    pub rule: usize,
+    pub source: Source,
+    /// The assignment was inherited from the parent process.
     pub inherited: bool,
     pub group: GroupId,
     pub protocol: RuleProtocol,
+    pub policy: PolicyId,
 }
 
-/// A connection attempt the platform asks the core about.
+/// A connection or socket the platform asks the core about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowQuery {
     pub pid: u32,
     pub protocol: Protocol,
-    pub remote: SocketAddr,
+    /// The destination, if already known. Without it only the process is
+    /// judged; the caller must check each destination against the returned
+    /// policy.
+    pub remote: Option<SocketAddr>,
 }
 
 /// What to do with a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Direct(DirectReason),
-    Proxy { group: GroupId },
+    Proxy { group: GroupId, policy: PolicyId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,8 +111,10 @@ pub enum DirectReason {
     NotAssigned,
     /// The covering rule does not include this protocol.
     ProtocolNotSelected,
-    /// The destination is loopback or matches a global exclusion.
+    /// The destination is local or matches a global exclusion.
     ExcludedDestination,
+    /// The covering rule's destination filter does not include it.
+    FilteredByRule,
 }
 
 impl DirectReason {
@@ -111,6 +125,30 @@ impl DirectReason {
             Self::NotAssigned => "not-assigned",
             Self::ProtocolNotSelected => "protocol-not-selected",
             Self::ExcludedDestination => "excluded-destination",
+            Self::FilteredByRule => "filtered-by-rule",
         }
     }
+}
+
+/// A process as shown to the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessView {
+    pub pid: u32,
+    pub instance: u64,
+    pub parent_pid: Option<u32>,
+    pub name: String,
+    pub alive: bool,
+    pub proxy: Option<ProxyView>,
+    /// Rules the user excluded this process (and its descendants) from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyView {
+    /// `None` for a manual assignment.
+    pub rule_id: Option<String>,
+    pub inherited: bool,
+    pub group: GroupId,
+    pub protocol: RuleProtocol,
 }
