@@ -31,6 +31,9 @@ enum Command {
     /// Runs under the Windows Service Control Manager.
     Service(service_app::ServiceArgs),
     #[cfg(windows)]
+    /// Restores system DNS settings left redirected by a crash (administrator).
+    RestoreDns(DataArgs),
+    #[cfg(windows)]
     /// Registers the Windows service (administrator).
     Install(service_app::ServiceArgs),
     #[cfg(windows)]
@@ -59,11 +62,44 @@ enum Command {
     GetConfig,
     #[cfg(windows)]
     /// Validates and replaces the service configuration.
-    SetConfig { #[arg(long)] config: PathBuf },
+    SetConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Args)]
+struct DataArgs {
+    /// Engine data directory [default: %ProgramData%\Stemma].
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+
+impl DataArgs {
+    fn dir(&self) -> anyhow::Result<PathBuf> {
+        match &self.data_dir {
+            Some(path) => Ok(std::path::absolute(path)?),
+            None => default_data_dir(),
+        }
+    }
+}
+
+fn default_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("ProgramData").context("ProgramData is not set")?)
+            .join("Stemma"),
+    )
+}
+
+/// The DNS journal inside a data directory.
+fn dns_journal(data: &Path) -> PathBuf {
+    data.join("state").join("dns-journal.json")
 }
 
 #[derive(Args)]
 struct ConsoleArgs {
+    #[command(flatten)]
+    data: DataArgs,
     /// Configuration file.
     #[arg(long)]
     config: PathBuf,
@@ -92,7 +128,14 @@ fn main() -> anyhow::Result<()> {
         #[cfg(windows)]
         Command::Install(args) => service_app::install(args),
         #[cfg(windows)]
-        Command::Uninstall => Ok(stemma_platform_windows::service::uninstall()?),
+        Command::RestoreDns(args) => restore_dns(&args.dir()?),
+        #[cfg(windows)]
+        Command::Uninstall => {
+            stemma_platform_windows::service::uninstall()?;
+            // The service restores DNS when it stops; this covers a service
+            // that could not.
+            restore_dns(&default_data_dir()?)
+        }
         #[cfg(windows)]
         Command::Start => Ok(stemma_platform_windows::service::start()?),
         #[cfg(windows)]
@@ -110,7 +153,9 @@ fn main() -> anyhow::Result<()> {
         #[cfg(windows)]
         Command::SetConfig { config } => {
             let config = Config::from_json(&std::fs::read_to_string(config)?)?;
-            service_app::client(stemma_ipc::Request::SetConfig { config: Box::new(config) })
+            service_app::client(stemma_ipc::Request::SetConfig {
+                config: Box::new(config),
+            })
         }
     }
 }
@@ -133,7 +178,10 @@ fn console(args: ConsoleArgs) -> anyhow::Result<()> {
 
     #[cfg(windows)]
     let _instance = stemma_platform_windows::EngineInstance::acquire()?;
-    let engine = start(&config, args.windivert_dir.as_deref())?;
+    let data = args.data.dir()?;
+    #[cfg(windows)]
+    restore_dns(&data)?;
+    let engine = start(&config, args.windivert_dir.as_deref(), &data)?;
     if let Some(path) = &args.ready_file {
         std::fs::write(path, "ready")?;
     }
@@ -152,10 +200,19 @@ fn console(args: ConsoleArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn start(config: &Config, windivert_dir: Option<&Path>) -> anyhow::Result<Engine> {
+fn restore_dns(data: &Path) -> anyhow::Result<()> {
+    let journal = dns_journal(data);
+    if stemma_engine::system_dns::recover(&stemma_platform_windows::WinSystemDns, &journal)? {
+        info!("restored DNS settings left by an earlier run");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start(config: &Config, windivert_dir: Option<&Path>, data: &Path) -> anyhow::Result<Engine> {
     use std::sync::Arc;
 
-    use stemma_engine::engine::Platform;
+    use stemma_engine::engine::{DnsBackend, Platform};
     use stemma_platform_windows::{
         EtwProcessSource, Interceptor, WinDivert, WinProcessInspector, clew_is_running, is_elevated,
     };
@@ -183,12 +240,16 @@ fn start(config: &Config, windivert_dir: Option<&Path>) -> anyhow::Result<Engine
             processes: Arc::new(EtwProcessSource::new()),
             inspector: Arc::new(WinProcessInspector),
             interceptor: Box::new(Interceptor::new(windivert, config.tcp_syn_parking.clone())),
+            dns: Some(DnsBackend {
+                system: Arc::new(stemma_platform_windows::WinSystemDns),
+                journal: dns_journal(data),
+            }),
         },
     )
 }
 
 #[cfg(not(windows))]
-fn start(_: &Config, _: Option<&Path>) -> anyhow::Result<Engine> {
+fn start(_: &Config, _: Option<&Path>, _: &Path) -> anyhow::Result<Engine> {
     bail!("this platform is not supported yet")
 }
 

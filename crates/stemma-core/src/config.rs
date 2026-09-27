@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use ipnet::IpNet;
@@ -23,6 +23,7 @@ pub struct Config {
     /// Destinations that are never proxied, whatever the rules say.
     pub global_exclude_cidrs: Vec<Cidr>,
     pub tcp_syn_parking: SynParking,
+    pub dns: DnsConfig,
     pub log_level: LogLevel,
 }
 
@@ -44,6 +45,7 @@ impl Default for Config {
                 .map(|s| s.parse().expect("built-in CIDR is valid"))
                 .collect(),
             tcp_syn_parking: SynParking::default(),
+            dns: DnsConfig::default(),
             log_level: LogLevel::default(),
         }
     }
@@ -233,6 +235,32 @@ impl Default for SynParking {
     }
 }
 
+/// System-wide DNS through the proxy. When enabled, the system's DNS servers
+/// point at a local forwarder that sends every query to `upstream` through
+/// the proxy group, over TCP.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsConfig {
+    pub enabled: bool,
+    /// Upstream resolver, reached through the proxy.
+    pub upstream: SocketAddr,
+    pub proxy_group_id: GroupId,
+    /// When the proxy path fails, queries normally go to the system's
+    /// original DNS servers directly. Strict mode fails them instead.
+    pub strict: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream: SocketAddr::from(([8, 8, 8, 8], 53)),
+            proxy_group_id: GroupId(0),
+            strict: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -377,6 +405,15 @@ impl Config {
                     rule.id, rule.proxy_group_id
                 ));
             }
+        }
+        if !group_ids.contains(&self.dns.proxy_group_id) {
+            problems.push(format!(
+                "dns refers to missing proxy group {}",
+                self.dns.proxy_group_id
+            ));
+        }
+        if self.dns.upstream.ip().is_unspecified() || self.dns.upstream.port() == 0 {
+            problems.push("dns.upstream must be a resolver address and port".to_owned());
         }
         let parking = &self.tcp_syn_parking;
         if !(5..=50).contains(&parking.watchdog_ms) {

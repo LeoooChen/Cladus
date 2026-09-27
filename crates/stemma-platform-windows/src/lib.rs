@@ -8,14 +8,16 @@
 #![cfg(windows)]
 
 pub mod divert;
+pub mod dns;
 pub mod etw;
-pub mod process;
-pub mod sockets;
-pub mod service;
-pub mod security;
 pub mod ipc;
+pub mod process;
+pub mod security;
+pub mod service;
+pub mod sockets;
 mod util;
 
 pub use divert::{Interceptor, WinDivert};
+pub use dns::WinSystemDns;
 pub use etw::EtwProcessSource;
 pub use process::{EngineInstance, WinProcessInspector, clew_is_running, is_elevated};

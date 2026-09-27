@@ -351,4 +351,3 @@ mod tests {
         assert!(slot.current("192.168.1.3:50000".parse().unwrap()).is_none());
     }
 }
-

@@ -13,13 +13,15 @@ use stemma_core::decision::DecisionCore;
 use stemma_core::model::{DirectReason, FlowQuery, GroupId, ProcessKey, ProcessView, Verdict};
 use stemma_core::platform::{
     Counter, DecisionOracle, Handoff, ProcessEvent, ProcessInspector, ProcessSource, RedirectedTcp,
-    TrafficInterceptor,
+    SystemDns, TrafficInterceptor,
 };
 use stemma_core::policy::{PolicyId, PolicyTable};
 use tokio::runtime::{Handle, Runtime};
 use tracing::{debug, info, warn};
 
+use crate::dns::{DnsCounters, DnsForwarder, DnsSettings};
 use crate::relay::{self, ProxyEndpoint, RelayCounters};
+use crate::system_dns::{DnsRedirect, LISTEN_V4, LISTEN_V6};
 use crate::udp::{UdpCounters, UdpRelay};
 
 /// The OS-specific parts the engine runs on.
@@ -27,6 +29,34 @@ pub struct Platform {
     pub processes: Arc<dyn ProcessSource>,
     pub inspector: Arc<dyn ProcessInspector>,
     pub interceptor: Box<dyn TrafficInterceptor>,
+    /// System DNS control; `None` where redirecting DNS is unsupported.
+    pub dns: Option<DnsBackend>,
+}
+
+pub struct DnsBackend {
+    pub system: Arc<dyn SystemDns>,
+    /// Original settings are recorded here while DNS is redirected.
+    pub journal: std::path::PathBuf,
+}
+
+/// Redirected system DNS and the forwarder serving it.
+struct DnsState {
+    forwarder: Arc<DnsForwarder>,
+    redirect: Arc<DnsRedirect>,
+    watcher: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
+}
+
+impl Drop for DnsState {
+    fn drop(&mut self) {
+        if let Some((stop, thread)) = self.watcher.take() {
+            drop(stop);
+            let _ = thread.join();
+        }
+        // Point the system back at its own servers before the forwarder goes.
+        if let Err(err) = self.redirect.restore() {
+            warn!("{err:#}");
+        }
+    }
 }
 
 type Groups = HashMap<GroupId, Arc<ProxyEndpoint>>;
@@ -131,6 +161,9 @@ pub struct Engine {
     interceptor: Box<dyn TrafficInterceptor>,
     relays: Arc<RelayCounters>,
     udp: Arc<UdpCounters>,
+    dns_backend: Option<DnsBackend>,
+    dns: Option<DnsState>,
+    dns_counters: Arc<DnsCounters>,
     housekeeping: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
     runtime: Option<Runtime>,
 }
@@ -189,6 +222,9 @@ impl Engine {
             interceptor: platform.interceptor,
             relays,
             udp,
+            dns_backend: platform.dns,
+            dns: None,
+            dns_counters: Arc::default(),
             housekeeping: Some(housekeeping),
             runtime: Some(runtime),
         };
@@ -208,6 +244,7 @@ impl Engine {
             .handle()
             .clone();
         let _ = udp_relay.set(UdpRelay::new(runtime, injector, Arc::clone(&engine.udp)));
+        engine.apply_dns(config)?;
         info!("engine started");
         Ok(engine)
     }
@@ -224,6 +261,7 @@ impl Engine {
         counters.extend(self.interceptor.counters());
         counters.extend(self.relays.snapshot());
         counters.extend(self.udp.snapshot());
+        counters.extend(self.dns_counters.snapshot());
         counters
     }
 
@@ -232,13 +270,84 @@ impl Engine {
     }
 
     /// Call only with a validated configuration.
-    pub fn reconfigure(&mut self, config: &Config) {
+    pub fn reconfigure(&mut self, config: &Config) -> anyhow::Result<()> {
         let mut core = self.core.lock_urgent();
         core.reconfigure(config, self.core.inspector.as_ref());
         *self.core.policies.write().unwrap() = core.policies();
         *self.groups.write().unwrap() = groups_of(config);
         drop(core);
         self.interceptor.refresh_assignments();
+        self.apply_dns(config)
+    }
+
+    fn apply_dns(&mut self, config: &Config) -> anyhow::Result<()> {
+        if !config.dns.enabled {
+            self.dns = None;
+            return Ok(());
+        }
+        let proxy = self
+            .groups
+            .read()
+            .unwrap()
+            .get(&config.dns.proxy_group_id)
+            .cloned();
+        let mut settings = DnsSettings {
+            upstream: config.dns.upstream,
+            proxy,
+            strict: config.dns.strict,
+            fallback: Vec::new(),
+        };
+        if let Some(state) = &self.dns {
+            settings.fallback = state.forwarder.fallback();
+            state.forwarder.update(settings);
+            return Ok(());
+        }
+        let backend = self
+            .dns_backend
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("redirecting system DNS is not supported here"))?;
+        let runtime = self.runtime.as_ref().expect("runtime is running").handle();
+        let listen = [
+            SocketAddr::from((LISTEN_V4, 53)),
+            SocketAddr::from((LISTEN_V6, 53)),
+        ];
+        let forwarder = Arc::new(
+            DnsForwarder::start(runtime, &listen, settings, Arc::clone(&self.dns_counters))
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "cannot start the DNS forwarder on port 53: {err}. Another program                          may own port 53 (outside the Stemma service, a port held by a                          system service cannot be shared)"
+                    )
+                })?,
+        );
+        let redirect = Arc::new(DnsRedirect::new(
+            Arc::clone(&backend.system),
+            backend.journal.clone(),
+        ));
+        let mut state = DnsState {
+            forwarder,
+            redirect,
+            watcher: None,
+        };
+        state.forwarder.set_fallback(state.redirect.apply()?);
+        let (forwarder, redirect) = (Arc::clone(&state.forwarder), Arc::clone(&state.redirect));
+        let (stop, stopped) = mpsc::channel::<()>();
+        // Interfaces that come up later are redirected too.
+        let thread = thread::Builder::new()
+            .name("stemma-dns-watch".to_owned())
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(Duration::from_secs(5))
+                {
+                    match redirect.apply() {
+                        Ok(servers) => forwarder.set_fallback(servers),
+                        Err(err) => warn!("cannot check interface DNS settings: {err:#}"),
+                    }
+                }
+            })?;
+        state.watcher = Some((stop, thread));
+        self.dns = Some(state);
+        info!("system DNS goes through the proxy");
+        Ok(())
     }
 
     pub fn set_manual(&mut self, process: ProcessKey, group: Option<GroupId>) -> bool {
@@ -246,7 +355,10 @@ impl Engine {
             return false;
         }
         let changed = self.core.lock_urgent().set_manual(
-            process.pid, group, self.core.inspector.as_ref(), Instant::now(),
+            process.pid,
+            group,
+            self.core.inspector.as_ref(),
+            Instant::now(),
         );
         self.interceptor.refresh_assignments();
         changed
@@ -257,7 +369,11 @@ impl Engine {
             return false;
         }
         let changed = self.core.lock_urgent().set_excluded(
-            process.pid, rule_id, excluded, self.core.inspector.as_ref(), Instant::now(),
+            process.pid,
+            rule_id,
+            excluded,
+            self.core.inspector.as_ref(),
+            Instant::now(),
         );
         self.interceptor.refresh_assignments();
         changed
@@ -273,6 +389,7 @@ impl Engine {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
+        self.dns = None;
         // Stop redirecting first: traffic flows directly from here on.
         self.interceptor.stop();
         self.processes.stop();

@@ -16,7 +16,11 @@ impl RollingLog {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { path: path.to_owned(), file: Some(file), size })
+        Ok(Self {
+            path: path.to_owned(),
+            file: Some(file),
+            size,
+        })
     }
 
     fn backup(&self, index: usize) -> PathBuf {
@@ -36,7 +40,10 @@ impl RollingLog {
             }
             fs::rename(&self.path, self.backup(1))
         })();
-        let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         self.size = file.metadata()?.len();
         self.file = Some(file);
         result
@@ -48,12 +55,19 @@ impl Write for RollingLog {
         if self.size >= LIMIT {
             self.rotate()?;
         }
-        let written = self.file.as_mut().ok_or_else(|| io::Error::other("log is closed"))?.write(bytes)?;
+        let written = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log is closed"))?
+            .write(bytes)?;
         self.size += written as u64;
         Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.as_mut().ok_or_else(|| io::Error::other("log is closed"))?.flush()
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log is closed"))?
+            .flush()
     }
 }

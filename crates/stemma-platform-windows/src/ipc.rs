@@ -54,7 +54,11 @@ async fn serve_client(mut pipe: NamedPipeServer, handler: Handler) -> io::Result
         return Err(err);
     }
     if !matches!(hello, Request::Hello { version: VERSION }) {
-        write_frame(&mut pipe, &Response::error("incompatible IPC protocol version")).await?;
+        write_frame(
+            &mut pipe,
+            &Response::error("incompatible IPC protocol version"),
+        )
+        .await?;
         return Ok(());
     }
     write_frame(&mut pipe, &Response::Hello { version: VERSION }).await?;
@@ -62,7 +66,8 @@ async fn serve_client(mut pipe: NamedPipeServer, handler: Handler) -> io::Result
         let request: Request = timeout(Duration::from_secs(60), read_frame(&mut pipe)).await??;
         let handler = Arc::clone(&handler);
         let response = tokio::task::spawn_blocking(move || handler(request))
-            .await.map_err(io::Error::other)?;
+            .await
+            .map_err(io::Error::other)?;
         timeout(Duration::from_secs(10), write_frame(&mut pipe, &response)).await??;
     }
 }
@@ -85,17 +90,23 @@ pub async fn request(request: &Request) -> io::Result<Response> {
         return Err(io::Error::last_os_error());
     }
     if actual != expected {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe server is not the Stemma Engine service"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pipe server is not the Stemma Engine service",
+        ));
     }
     timeout(Duration::from_secs(30), async {
         write_frame(&mut pipe, &Request::Hello { version: VERSION }).await?;
         let response: Response = read_frame(&mut pipe).await?;
         match response {
             Response::Hello { version: VERSION } => {}
-            Response::Error { message } => return Err(io::Error::new(io::ErrorKind::PermissionDenied, message)),
+            Response::Error { message } => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+            }
             _ => return Err(io::Error::other("incompatible engine handshake")),
         }
         write_frame(&mut pipe, request).await?;
         read_frame(&mut pipe).await
-    }).await?
+    })
+    .await?
 }

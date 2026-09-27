@@ -18,8 +18,8 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl,
     GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TokenGroups,
-    WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TokenGroups, WELL_KNOWN_SID_TYPE,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
@@ -43,8 +43,14 @@ fn descriptor(sddl: &str) -> io::Result<LocalMemory> {
     let mut pointer = null_mut();
     // SAFETY: the input is terminated and the output pointer is writable.
     if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(sddl).as_ptr(), 1, &mut pointer, null_mut())
-    } == 0 {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(sddl).as_ptr(),
+            1,
+            &mut pointer,
+            null_mut(),
+        )
+    } == 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(LocalMemory(pointer))
@@ -82,13 +88,23 @@ pub fn secure_directory(path: &Path) -> io::Result<()> {
         .open(path)?;
     let metadata = directory.metadata()?;
     if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::other("service data directory must not be a file or reparse point"));
+        return Err(io::Error::other(
+            "service data directory must not be a file or reparse point",
+        ));
     }
     let (mut owner, mut allocation) = (null_mut(), null_mut());
     // SAFETY: the directory handle is open and all out pointers are valid.
     let rc = unsafe {
-        GetSecurityInfo(directory.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-            &mut owner, null_mut(), null_mut(), null_mut(), &mut allocation)
+        GetSecurityInfo(
+            directory.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut allocation,
+        )
     };
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc as i32));
@@ -96,27 +112,44 @@ pub fn secure_directory(path: &Path) -> io::Result<()> {
     let _allocation = LocalMemory(allocation);
     let (admins, system) = (sid(WinBuiltinAdministratorsSid)?, sid(WinLocalSystemSid)?);
     // SAFETY: all three SIDs come from successful security APIs and are alive.
-    let trusted = !owner.is_null() && unsafe {
-        EqualSid(owner, admins.as_ptr().cast_mut().cast()) != 0
-            || EqualSid(owner, system.as_ptr().cast_mut().cast()) != 0
-    };
+    let trusted = !owner.is_null()
+        && unsafe {
+            EqualSid(owner, admins.as_ptr().cast_mut().cast()) != 0
+                || EqualSid(owner, system.as_ptr().cast_mut().cast()) != 0
+        };
     if !trusted {
-        return Err(io::Error::other("service data directory is not owned by SYSTEM or Administrators"));
+        return Err(io::Error::other(
+            "service data directory is not owned by SYSTEM or Administrators",
+        ));
     }
     let (mut present, mut defaulted, mut acl) = (0, 0, null_mut());
     // SAFETY: the parsed descriptor is valid and contains a DACL.
-    if unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted) } == 0
-        || present == 0 || acl.is_null()
+    if unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted) }
+        == 0
+        || present == 0
+        || acl.is_null()
     {
-        return Err(io::Error::other("invalid service directory security descriptor"));
+        return Err(io::Error::other(
+            "invalid service directory security descriptor",
+        ));
     }
     // SAFETY: valid handle and ACL; the directory remains open against rename.
     let rc = unsafe {
-        SetSecurityInfo(directory.as_raw_handle(), SE_FILE_OBJECT,
+        SetSecurityInfo(
+            directory.as_raw_handle(),
+            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(), null_mut(), acl, null())
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
     };
-    if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc as i32)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc as i32))
+    }
 }
 
 pub(crate) fn create_pipe(name: &str, first: bool) -> io::Result<NamedPipeServer> {
@@ -131,7 +164,10 @@ pub(crate) fn create_pipe(name: &str, first: bool) -> io::Result<NamedPipeServer
         ServerOptions::new()
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .create_with_security_attributes_raw(name, (&mut attributes as *mut SECURITY_ATTRIBUTES).cast())
+            .create_with_security_attributes_raw(
+                name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
+            )
     }
 }
 
@@ -167,7 +203,16 @@ pub(crate) fn authorize_client(pipe: &NamedPipeServer) -> io::Result<()> {
     }
     let mut storage = vec![0u64; (needed as usize).div_ceil(8)];
     // SAFETY: storage is aligned and has at least `needed` writable bytes.
-    if unsafe { GetTokenInformation(token.0, TokenGroups, storage.as_mut_ptr().cast(), needed, &mut needed) } == 0 {
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenGroups,
+            storage.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
         return Err(io::Error::last_os_error());
     }
     let admins = sid(WinBuiltinAdministratorsSid)?;
@@ -175,11 +220,17 @@ pub(crate) fn authorize_client(pipe: &NamedPipeServer) -> io::Result<()> {
     let authorized = unsafe {
         let groups = &*storage.as_ptr().cast::<TOKEN_GROUPS>();
         std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
-            .iter().any(|group| EqualSid(group.Sid, admins.as_ptr().cast_mut().cast()) != 0)
+            .iter()
+            .any(|group| EqualSid(group.Sid, admins.as_ptr().cast_mut().cast()) != 0)
     };
     // A filtered administrator carries BA as deny-only. Membership (rather
     // than enabled privileges) is intentional: the GUI must not require UAC.
-    if authorized { Ok(()) } else {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "only local administrators may control Stemma"))
+    if authorized {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "only local administrators may control Stemma",
+        ))
     }
 }

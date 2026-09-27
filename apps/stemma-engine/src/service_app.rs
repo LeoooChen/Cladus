@@ -18,17 +18,26 @@ pub struct ServiceArgs {
     /// Directory containing the WinDivert DLL and driver [default: executable directory].
     #[arg(long)]
     windivert_dir: Option<PathBuf>,
+    /// Engage even while Clew runs (for testing on machines that need Clew).
+    #[arg(long, hide = true)]
+    allow_clew: bool,
 }
 
 impl ServiceArgs {
     fn paths(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
         let data = match &self.data_dir {
             Some(path) => path.clone(),
-            None => PathBuf::from(std::env::var_os("ProgramData").context("ProgramData is not set")?).join("Stemma"),
+            None => {
+                PathBuf::from(std::env::var_os("ProgramData").context("ProgramData is not set")?)
+                    .join("Stemma")
+            }
         };
         let divert = match &self.windivert_dir {
             Some(path) => path.clone(),
-            None => std::env::current_exe()?.parent().context("missing executable directory")?.to_owned(),
+            None => std::env::current_exe()?
+                .parent()
+                .context("missing executable directory")?
+                .to_owned(),
         };
         Ok((std::path::absolute(data)?, std::path::absolute(divert)?))
     }
@@ -43,18 +52,31 @@ pub fn install(args: ServiceArgs) -> anyhow::Result<()> {
     } else {
         Config::from_json(&std::fs::read_to_string(&path)?)?;
     }
-    service::install(&std::env::current_exe()?, &data, &divert)?;
+    let extra: &[&str] = if args.allow_clew {
+        &["--allow-clew"]
+    } else {
+        &[]
+    };
+    service::install(&std::env::current_exe()?, &data, &divert, extra)?;
     println!("Stemma Engine installed. Run `stemma-engine start` to start the idle service.");
     Ok(())
 }
 
 pub fn dispatch(args: ServiceArgs) -> anyhow::Result<()> {
     let (data, divert) = args.paths()?;
-    service::dispatch(move |stop| run(data, divert, stop).map_err(|err| format!("{err:#}")))?;
+    let allow_clew = args.allow_clew;
+    service::dispatch(move |stop| {
+        run(data, divert, allow_clew, stop).map_err(|err| format!("{err:#}"))
+    })?;
     Ok(())
 }
 
-fn run(data: PathBuf, divert: PathBuf, stopped: mpsc::Receiver<()>) -> anyhow::Result<()> {
+fn run(
+    data: PathBuf,
+    divert: PathBuf,
+    allow_clew: bool,
+    stopped: mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
     let _instance = EngineInstance::acquire()?;
     security::secure_directory(&data)?;
     let logs = data.join("logs");
@@ -63,17 +85,28 @@ fn run(data: PathBuf, divert: PathBuf, stopped: mpsc::Receiver<()>) -> anyhow::R
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(Mutex::new(writer))
-        .with_env_filter(EnvFilter::try_from_env("STEMMA_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
-        .try_init().map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        .with_env_filter(
+            EnvFilter::try_from_env("STEMMA_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    // A crash may have left the system's DNS pointing at the forwarder.
+    if let Err(err) = super::restore_dns(&data) {
+        tracing::error!("{err:#}");
+    }
+    let state = data.clone();
     let controller = Controller::start(data.join("config.json"), move |config| {
-        if stemma_platform_windows::clew_is_running() {
+        if !allow_clew && stemma_platform_windows::clew_is_running() {
             bail!("Clew is running; exit it before engaging the Stemma service");
         }
-        super::start(config, Some(&divert))
+        super::start(config, Some(&divert), &state)
     })?;
     let client = controller.client();
     let handler: ipc::Handler = Arc::new(move |request| client.call(request));
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
     tracing::info!("service ready; proxying is idle");
     let result = runtime.block_on(async {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -98,7 +131,9 @@ fn run(data: PathBuf, divert: PathBuf, stopped: mpsc::Receiver<()>) -> anyhow::R
 }
 
 pub fn client(request: Request) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let response = runtime.block_on(ipc::request(&request))?;
     if let Response::Error { message } = response {
         bail!("{message}");

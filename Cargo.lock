@@ -427,6 +427,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "serde",
  "serde_json",
  "stemma-core",
  "stemma-ipc",

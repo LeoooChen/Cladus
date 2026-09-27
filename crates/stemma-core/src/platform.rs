@@ -159,3 +159,38 @@ pub trait TrafficInterceptor: Send {
     /// Invalidates cached socket assignments after rules or manual choices change.
     fn refresh_assignments(&self) {}
 }
+
+/// One address family's DNS settings on an interface.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DnsServers {
+    /// Servers come from DHCP/router advertisement rather than configuration.
+    pub automatic: bool,
+    /// The servers in effect when captured.
+    pub servers: Vec<std::net::IpAddr>,
+}
+
+/// An interface's DNS settings, as needed to restore them exactly.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InterfaceDns {
+    /// Stable interface identifier (a GUID on Windows).
+    pub id: String,
+    /// For logs only.
+    pub name: String,
+    pub v4: DnsServers,
+    pub v6: DnsServers,
+}
+
+/// The system resolver configuration.
+pub trait SystemDns: Send + Sync {
+    /// Settings of every interface whose DNS may be redirected.
+    fn capture(&self) -> Result<Vec<InterfaceDns>, PlatformError>;
+    /// Points the interface's DNS at the local forwarder.
+    fn redirect(
+        &self,
+        id: &str,
+        v4: std::net::Ipv4Addr,
+        v6: std::net::Ipv6Addr,
+    ) -> Result<(), PlatformError>;
+    /// Returns the interface to its captured settings.
+    fn restore(&self, original: &InterfaceDns) -> Result<(), PlatformError>;
+}
