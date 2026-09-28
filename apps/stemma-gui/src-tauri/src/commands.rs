@@ -426,6 +426,16 @@ pub async fn migrate_group(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn check_group(id: u32) -> Result<Value> {
+    Ok(
+        match engine::ok(Request::CheckProxy { group: GroupId(id) }).await {
+            Ok(()) => json!({ "reachable": true }),
+            Err(error) => json!({ "reachable": false, "error": error }),
+        },
+    )
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn test_group(id: u32) -> Result<Value> {
     Ok(
         match engine::call(Request::TestProxy { group: GroupId(id) }).await {

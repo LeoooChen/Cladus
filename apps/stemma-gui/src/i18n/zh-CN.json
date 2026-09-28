@@ -1,4 +1,10 @@
 {
+  "Checking proxy…": "正在检测代理…",
+  "Proxy reachable": "代理可连接",
+  "Proxy unreachable": "代理无法连接",
+  "Checks the proxy connection only; use the website test below for Internet access.": "只检查代理连接；网站访问情况请使用下方测速。",
+  "HTTP response time through the proxy, including TLS": "通过代理收到网站 HTTP 响应的耗时（包含 TLS 握手）",
+  "Test failed": "测试失败",
   "Network Activities": "网络活动",
   "Rules": "规则",
   "Proxies": "代理",

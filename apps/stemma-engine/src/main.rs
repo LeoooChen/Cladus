@@ -76,6 +76,12 @@ enum Command {
     /// Prints the service configuration.
     GetConfig,
     #[cfg(windows)]
+    /// Measures HTTP(S) response time through a configured proxy group.
+    TestProxy {
+        #[arg(long, default_value_t = 0)]
+        group: u32,
+    },
+    #[cfg(windows)]
     /// Validates and replaces the service configuration.
     SetConfig {
         #[arg(long)]
@@ -183,6 +189,10 @@ fn main() -> anyhow::Result<()> {
         Command::Processes => service_app::client(stemma_ipc::Request::Processes),
         #[cfg(windows)]
         Command::GetConfig => service_app::client(stemma_ipc::Request::GetConfig),
+        #[cfg(windows)]
+        Command::TestProxy { group } => service_app::client(stemma_ipc::Request::TestProxy {
+            group: stemma_core::model::GroupId(group),
+        }),
         #[cfg(windows)]
         Command::SetConfig { config } => {
             let config = Config::from_json(&std::fs::read_to_string(config)?)?;

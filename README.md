@@ -4,7 +4,7 @@ Windows per-process TCP/UDP proxying in Rust, without TUN or DLL injection.
 Rules follow a process's descendants, including children that outlive their
 launcher. WinDivert redirects traffic to a SOCKS5 server.
 
-Windows 0.1.0 includes the service, desktop GUI, DNS forwarding, Clew importer
+Windows 0.1.1 includes the service, desktop GUI, DNS forwarding, Clew importer
 and installer. See [verification status](docs/STATUS.md) for tested behavior
 and remaining release checks. Linux/macOS backends are deferred; portable
 logic remains separated in `stemma-core`.
@@ -12,7 +12,7 @@ logic remains separated in `stemma-core`.
 ## Install and use
 
 Requires Windows 10 2004 (build 19041) or newer, x64. Run
-`stemma-0.1.0-windows-x64-setup.exe` as administrator. Setup installs WebView2
+`stemma-0.1.1-windows-x64-setup.exe` as administrator. Setup installs WebView2
 if missing (Internet access needed), registers the Stemma Engine service and
 starts it **idle**. Subsequent GUI launches do not need elevation for Windows
 administrators using their normal UAC token. Standard users who are not members
@@ -27,6 +27,19 @@ of Administrators cannot control the engine.
    manual proxy assignments and exclusions.
 4. Enable optional DNS forwarding in settings if needed. It is off by default.
    Language, close-to-tray, logon startup and minimized startup are configurable.
+
+The small light to the right of each proxy address checks its SOCKS5 connection
+and authentication automatically on opening the proxy tab and after saving.
+Gray means checking, green means reachable, and red means failure (hover for the
+reason; click to retry). Green does not guarantee Internet access. The separate
+website button measures time to HTTP response headers, including TLS for HTTPS,
+with target DNS resolved by the proxy and an overall 20-second timeout.
+
+If the proxy light is green but Edge still cannot open Google, enable **DNS
+Proxy**: ordinary browser connections otherwise use system DNS, which may return
+incorrect destination addresses. Restart the affected browser to discard its
+cached DNS and connections. The website latency test uses proxy-side DNS and
+therefore does not by itself verify the browser's system DNS path.
 
 Opening the GUI engages the engine. Closing the window hides it to the tray
 by default; **Exit** stops proxying, restores DNS and leaves the service idle.

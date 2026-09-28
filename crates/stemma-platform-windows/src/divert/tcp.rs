@@ -1,17 +1,17 @@
 //! TCP interception: CONNECT decisions from the socket layer, SYN parking,
 //! and reflection of proxied flows into the local acceptor.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use stemma_core::config::SynParking;
 use stemma_core::model::{FlowQuery, GroupId, Protocol, Verdict};
 use stemma_core::platform::{Counter, DecisionOracle, FlowLease, PlatformError, RedirectedTcp};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 
@@ -46,7 +46,7 @@ struct Shared {
 pub(super) struct Tcp {
     shared: Arc<Shared>,
     socket: Arc<Handle>,
-    stop: Arc<AtomicBool>,
+    stop: oneshot::Sender<()>,
     workers: Vec<JoinHandle<()>>,
     socket_thread: JoinHandle<()>,
     injector: Option<JoinHandle<()>>,
@@ -72,6 +72,20 @@ impl Tcp {
             .local_addr()
             .map_err(|e| PlatformError::Other(e.to_string()))?
             .port();
+        // The accept loop has its own event-driven runtime. Shutdown must not
+        // depend on a loopback connection succeeding (firewall/service isolation).
+        let accept_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PlatformError::Other(format!("cannot start TCP accept runtime: {e}")))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| PlatformError::Other(e.to_string()))?;
+        let listener = {
+            let _guard = accept_runtime.enter();
+            tokio::net::TcpListener::from_std(listener)
+                .map_err(|e| PlatformError::Other(e.to_string()))?
+        };
         let network = Handle::open(api, NETWORK_FILTER, ffi::LAYER_NETWORK, NETWORK_PRIORITY, 0)?;
         network.set_param(ffi::PARAM_QUEUE_LENGTH, 16_384);
         network.set_param(ffi::PARAM_QUEUE_TIME, 2_000);
@@ -105,7 +119,7 @@ impl Tcp {
             acceptor_port,
             counters: Arc::clone(&counters),
         });
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = oneshot::channel();
 
         let socket_thread = spawn("stemma-tcp-socket", {
             let (shared, socket) = (Arc::clone(&shared), Arc::clone(&socket));
@@ -129,8 +143,15 @@ impl Tcp {
             })
             .collect();
         let acceptor = spawn("stemma-tcp-accept", {
-            let stop = Arc::clone(&stop);
-            move || accept_loop(&listener, &trackers, handoff.as_ref(), &stop, &counters)
+            move || {
+                accept_runtime.block_on(accept_loop(
+                    &listener,
+                    &trackers,
+                    handoff.as_ref(),
+                    stopped,
+                    &counters,
+                ))
+            }
         });
         Ok(Self {
             shared,
@@ -144,7 +165,7 @@ impl Tcp {
     }
 
     pub(super) fn stop(self) {
-        self.stop.store(true, Relaxed);
+        let _ = self.stop.send(());
         // From here on packets are no longer captured; the workers still send
         // on what is already queued.
         self.shared.network.shutdown_recv();
@@ -159,8 +180,6 @@ impl Tcp {
         if let Some(injector) = self.injector {
             let _ = injector.join();
         }
-        let wake = SocketAddr::from((Ipv6Addr::LOCALHOST, self.shared.acceptor_port));
-        let _ = TcpStream::connect_timeout(&wake, Duration::from_secs(1));
         let _ = self.acceptor.join();
         info!("TCP interception stopped");
     }
@@ -420,22 +439,27 @@ fn send_unchanged(shared: &Shared, packet: &[u8], addr: &Address) {
     }
 }
 
-fn accept_loop(
-    listener: &TcpListener,
+async fn accept_loop(
+    listener: &tokio::net::TcpListener,
     trackers: &Arc<Trackers>,
     handoff: &(dyn Fn(RedirectedTcp) + Send + Sync),
-    stop: &AtomicBool,
+    mut stop: oneshot::Receiver<()>,
     counters: &Counters,
 ) {
-    for stream in listener.incoming() {
-        if stop.load(Relaxed) {
-            return;
-        }
-        let stream = match stream {
-            Ok(stream) => stream,
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = &mut stop => return,
+            accepted = listener.accept() => accepted,
+        };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
             Err(err) => {
                 debug!(%err, "accept failed");
-                thread::sleep(Duration::from_millis(10));
+                tokio::select! {
+                    _ = &mut stop => return,
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                }
                 continue;
             }
         };
@@ -456,6 +480,9 @@ fn accept_loop(
         };
         counters.tcp_accepted.fetch_add(1, Relaxed);
         let lease_trackers = Arc::clone(trackers);
+        let Ok(stream) = stream.into_std() else {
+            continue;
+        };
         handoff(RedirectedTcp {
             stream,
             original_dst: SocketAddr::new(taken.remote_ip, taken.remote_port),
@@ -464,5 +491,32 @@ fn accept_loop(
                 lease_trackers[family].clear_if(port, taken.word);
             }),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acceptor_cancels_without_any_wakeup_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let trackers = Arc::new([PortTracker::new(1), PortTracker::new(1)]);
+        let counters = Counters::default();
+        let (stop, stopped) = oneshot::channel();
+        let handoff = |_: RedirectedTcp| panic!("no connection should arrive");
+        let accepting = accept_loop(&listener, &trackers, &handoff, stopped, &counters);
+        let cancel = async {
+            tokio::task::yield_now().await;
+            stop.send(()).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(accepting, cancel);
+        })
+        .await
+        .expect("idle accept must be cancellable without network activity");
+        drop(listener);
+        assert!(TcpListener::bind(address).is_ok());
     }
 }

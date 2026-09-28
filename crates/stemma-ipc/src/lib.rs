@@ -43,6 +43,10 @@ pub enum Request {
     TestProxy {
         group: GroupId,
     },
+    /// Checks SOCKS5 connection/authentication without contacting a website.
+    CheckProxy {
+        group: GroupId,
+    },
     SetExcluded {
         process: ProcessKey,
         rule_id: String,

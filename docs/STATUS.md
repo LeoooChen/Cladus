@@ -1,7 +1,7 @@
 # Development status
 
-Updated 2026-09-28. Windows 0.1.0 is packaged and has passed the local acceptance
-suite. Linux/macOS implementation is explicitly deferred. The original design
+Updated 2026-09-28. The 0.1.0 baseline is recorded below; see the final section
+for 0.1.1 repairs and current verification. Linux/macOS is explicitly deferred. The original design
 is in DESIGN.md; this file records the actual implementation and verification.
 
 ## Delivered on Windows
@@ -83,3 +83,31 @@ installed as the user's daily proxy.
   telemetry remain future work. JSON credentials work in the engine.
 - Fragmented/IPsec traffic is not relayed. Traffic interception is fail-open.
   DNS fallback is direct unless strict mode is selected.
+
+## 0.1.1 repair verification (2026-09-28)
+
+- Reproduced the installed service stuck in TCP accept during Disengage. An
+  explicit connection to its redirect listener immediately released shutdown,
+  confirming that relying on a loopback wakeup could leave the service hanging.
+  The implementation now cancels an asynchronous accept with a oneshot signal.
+- The old website probe stopped after SOCKS5 CONNECT. The replacement waits for
+  real HTTP response headers, verifies TLS, uses proxy-side target DNS and has
+  a total timeout. The independent signal light checks only SOCKS5/authentication.
+- 131 default Rust tests passed; 28 Playwright tests passed, including delayed
+  stale health responses after saving new proxy settings. Clippy and dependency
+  audit passed. An additional opt-in live test reached Google through the user's
+  SOCKS5 endpoint and measured 222 ms including TLS.
+- Local DNS + SOCKS5 failed Google's TLS handshake, while proxy-side domain
+  resolution returned HTTP 200. The installed config had DNS proxy disabled;
+  users in this situation should enable DNS proxy and restart affected browsers
+  to clear cached DNS/connections. This is separate from SOCKS5 reachability.
+- Browser automation is unavailable for the user's Edge session. Native Edge
+  acceptance must not be inferred from the mocked frontend or HTTP client tests.
+- The old installed service was recovered and GUI exited normally. Installation
+  of the new build and post-upgrade native acceptance remain separate steps.
+
+See CHANGELOG.md for 0.1.1 changes. The 0.1.0 evidence above is historical.
+
+0.1.1 local package: `target/installer/stemma-0.1.1-windows-x64-setup.exe`,
+7,625,515 bytes. SHA-256:
+`14ab9c4a5f679ca30133e2973374bc42397e8fa50dbeda9ba25c0fe96dc59c54`.

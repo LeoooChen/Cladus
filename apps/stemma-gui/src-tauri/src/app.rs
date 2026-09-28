@@ -122,6 +122,7 @@ pub fn run() {
             commands::delete_group,
             commands::migrate_group,
             commands::test_group,
+            commands::check_group,
             commands::reveal_file,
             commands::browse_exe,
             commands::get_autostart,
@@ -391,7 +392,10 @@ async fn poll(app: AppHandle) {
     let mut last_tree = None;
     loop {
         if state.quitting.load(Ordering::SeqCst) {
-            return;
+            // Failed shutdown resets `quitting` and wakes this loop. Keep the
+            // observer alive without re-engaging while shutdown is pending.
+            state.wake.notified().await;
+            continue;
         }
         let mut next = EngineState::default();
         match engine::status().await {
@@ -407,7 +411,7 @@ async fn poll(app: AppHandle) {
                 if !status.engaged {
                     let _lifecycle = state.lifecycle.lock().await;
                     if state.quitting.load(Ordering::SeqCst) {
-                        return;
+                        continue;
                     }
                     match engine::ok(Request::Engage).await {
                         Ok(()) => next.engaged = true,

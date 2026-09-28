@@ -135,6 +135,10 @@ export function testProxyGroup(id: number): Promise<ProxyTestResult> {
   return call<ProxyTestResult>('test_group', { id })
 }
 
+export function checkProxyGroup(id: number): Promise<{ reachable: boolean; error?: string }> {
+  return call('check_group', { id })
+}
+
 // -- Stats --
 
 export function getStats(): Promise<Stats> {

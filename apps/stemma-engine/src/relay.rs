@@ -17,6 +17,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const BUFFER_SIZE: usize = 64 * 1024;
 
+/// SOCKS5 reachability/authentication only, without contacting a website.
+pub async fn check_proxy(proxy: &ProxyEndpoint) -> Result<(), String> {
+    timeout(Duration::from_secs(3), async {
+        let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port))
+            .await
+            .map_err(|err| format!("cannot reach SOCKS5 proxy: {err}"))?;
+        socks5::negotiate(&mut stream, proxy.credentials.as_ref())
+            .await
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|_| "SOCKS5 proxy check timed out".to_owned())?
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyEndpoint {
     pub host: String,
@@ -117,47 +131,54 @@ pub async fn relay(
     )
 }
 
-/// Time until the proxy has connected to the host of `url`: the latency a
-/// new proxied connection would see.
+/// Time to receive HTTP response headers through the proxy, including SOCKS5
+/// connection and TLS. The proxy resolves the target name (socks5h), so local
+/// DNS poisoning cannot turn a successful local handshake into a false result.
 pub async fn probe(proxy: &ProxyEndpoint, url: &str) -> Result<Duration, String> {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let default_port = if url.starts_with("http://") { 80 } else { 443 };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.ends_with(']') || authority.starts_with('[') => {
-            match port.parse() {
-                Ok(port) => (host, port),
-                Err(_) => (authority, default_port),
-            }
-        }
-        _ => (authority, default_port),
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.is_empty() {
-        return Err(format!("invalid test URL `{url}`"));
+    probe_with_timeout(proxy, url, Duration::from_secs(20)).await
+}
+
+async fn probe_with_timeout(
+    proxy: &ProxyEndpoint,
+    url: &str,
+    limit: Duration,
+) -> Result<Duration, String> {
+    let target = reqwest::Url::parse(url).map_err(|err| format!("invalid test URL: {err}"))?;
+    if !matches!(target.scheme(), "http" | "https") || target.host_str().is_none() {
+        return Err("test URL must use http:// or https://".to_owned());
     }
-    let target = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|err| format!("cannot resolve {host}: {err}"))?
-        .next()
-        .ok_or_else(|| format!("{host} has no address"))?;
+    let mut endpoint = reqwest::Url::parse("socks5h://localhost").expect("built-in URL");
+    endpoint
+        .set_host(Some(&proxy.host))
+        .map_err(|err| format!("invalid proxy host: {err}"))?;
+    endpoint
+        .set_port(Some(proxy.port))
+        .map_err(|_| "invalid proxy port")?;
+    let mut transport = reqwest::Proxy::all(endpoint).map_err(|err| err.to_string())?;
+    if let Some(credentials) = &proxy.credentials {
+        transport = transport.basic_auth(&credentials.username, &credentials.password);
+    }
+    // A fresh client prevents cached connections from hiding connection/TLS time.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(transport)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(limit)
+        .build()
+        .map_err(|err| format!("cannot create website probe: {err}"))?;
     let started = std::time::Instant::now();
-    let name = format!("{}:{}", proxy.host, proxy.port);
-    let mut stream = timeout(
-        CONNECT_TIMEOUT,
-        TcpStream::connect((proxy.host.as_str(), proxy.port)),
-    )
+    timeout(limit, async {
+        client
+            .get(target)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|err| format!("website probe failed: {err}"))?;
+        Ok(started.elapsed())
+    })
     .await
-    .map_err(|_| format!("proxy {name} did not answer in time"))?
-    .map_err(|err| format!("cannot reach proxy {name}: {err}"))?;
-    timeout(
-        HANDSHAKE_TIMEOUT,
-        socks5::connect(&mut stream, target, proxy.credentials.as_ref()),
-    )
-    .await
-    .map_err(|_| format!("{host}:{port} was not reached in time"))?
-    .map_err(|err| err.to_string())?;
-    Ok(started.elapsed())
+    .map_err(|_| "website response timed out".to_owned())?
 }
 
 #[cfg(test)]
@@ -166,6 +187,145 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn health_check_negotiates_without_a_website_and_rejects_auth_failure() {
+        for accepted in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = ProxyEndpoint {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                credentials: None,
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream
+                    .write_all(&[5, if accepted { 0 } else { 255 }])
+                    .await
+                    .unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    stream.read(&mut byte).await.unwrap(),
+                    0,
+                    "health check must not open a website tunnel"
+                );
+            });
+            assert_eq!(check_proxy(&proxy).await.is_ok(), accepted);
+            server.await.unwrap();
+        }
+    }
+
+    async fn website_proxy(
+        delay: Duration,
+        status: u16,
+        close_after_handshake: bool,
+    ) -> (ProxyEndpoint, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0; greeting[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(
+                header,
+                [5, 1, 0, 3],
+                "target DNS must be resolved by the proxy"
+            );
+            let len = stream.read_u8().await.unwrap();
+            let mut domain = vec![0; len as usize];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"probe.invalid");
+            let _port = stream.read_u16().await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            if close_after_handshake {
+                return;
+            }
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() < 8192);
+            }
+            assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+            tokio::time::sleep(delay).await;
+            let response =
+                format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (
+            ProxyEndpoint {
+                host: "127.0.0.1".into(),
+                port,
+                credentials: None,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn probe_waits_for_http_headers_and_uses_remote_dns() {
+        let delay = Duration::from_millis(120);
+        let (proxy, server) = website_proxy(delay, 204, false).await;
+        let elapsed = probe(&proxy, "http://probe.invalid/health").await.unwrap();
+        assert!(
+            elapsed >= delay,
+            "a SOCKS5 handshake is not website latency"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_http_error_and_failed_tls_after_successful_socks() {
+        let (proxy, server) = website_proxy(Duration::ZERO, 502, false).await;
+        assert!(
+            probe(&proxy, "http://probe.invalid/health")
+                .await
+                .unwrap_err()
+                .contains("502")
+        );
+        server.await.unwrap();
+        let (proxy, server) = website_proxy(Duration::ZERO, 200, true).await;
+        assert!(probe(&proxy, "https://probe.invalid/health").await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_covers_response_wait_and_can_be_cancelled() {
+        let (proxy, server) = website_proxy(Duration::from_secs(5), 200, false).await;
+        let result = probe_with_timeout(
+            &proxy,
+            "http://probe.invalid/health",
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a nonresponding website must not produce a latency"
+        );
+        server.abort();
+        let (proxy, server) = website_proxy(Duration::from_secs(5), 200, false).await;
+        let task = tokio::spawn(async move { probe(&proxy, "http://probe.invalid/health").await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        server.abort();
+    }
 
     /// A SOCKS5 server that accepts one CONNECT and echoes the tunnel.
     async fn echo_proxy() -> (u16, tokio::task::JoinHandle<SocketAddr>) {

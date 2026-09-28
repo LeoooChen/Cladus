@@ -1,7 +1,9 @@
 //! Local named-pipe transport. Authorization happens before engine commands.
 
+use std::future::Future;
 use std::io;
 use std::os::windows::io::AsRawHandle;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +16,8 @@ use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 
 use crate::security::{authorize_client, create_pipe};
 
-pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
+pub type Handler =
+    Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
 pub async fn serve(handler: Handler, mut stop: oneshot::Receiver<()>) -> io::Result<()> {
     let mut server = create_pipe(PIPE_NAME, true)?;
@@ -64,10 +67,9 @@ async fn serve_client(mut pipe: NamedPipeServer, handler: Handler) -> io::Result
     write_frame(&mut pipe, &Response::Hello { version: VERSION }).await?;
     loop {
         let request: Request = timeout(Duration::from_secs(60), read_frame(&mut pipe)).await??;
-        let handler = Arc::clone(&handler);
-        let response = tokio::task::spawn_blocking(move || handler(request))
-            .await
-            .map_err(io::Error::other)?;
+        // Async network operations remain cancellable when the server stops.
+        // The handler isolates any synchronous controller calls itself.
+        let response = handler(request).await;
         timeout(Duration::from_secs(10), write_frame(&mut pipe, &response)).await??;
     }
 }

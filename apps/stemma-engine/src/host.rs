@@ -194,7 +194,9 @@ impl State {
                     .unwrap_or_default(),
             ),
             // Served by `test_proxy` without holding up the control thread.
-            Request::TestProxy { .. } => Response::error("unsupported here"),
+            Request::TestProxy { .. } | Request::CheckProxy { .. } => {
+                Response::error("unsupported here")
+            }
             Request::ProcessDetail { process } => {
                 let engine = self.engine.as_ref().context("engine is not engaged")?;
                 let (image_path, cmdline) = engine
@@ -241,26 +243,45 @@ impl State {
     }
 }
 
-/// Answers [`Request::TestProxy`]. Blocks for up to about 20 seconds, so
-/// call it outside the control thread.
-pub fn test_proxy(client: &Client, group: stemma_core::model::GroupId) -> Response {
-    let Response::Config(config) = client.call(Request::GetConfig) else {
-        return Response::error("cannot read the configuration");
+/// Answers [`Request::TestProxy`] without blocking an IPC runtime worker or
+/// the serialized controller while the remote website responds.
+pub async fn test_proxy(client: Client, group: stemma_core::model::GroupId) -> Response {
+    let group = match configured_group(client, group).await {
+        Ok(group) => group,
+        Err(err) => return Response::error(err),
     };
-    let Some(group) = config.group(group) else {
-        return Response::error("unknown proxy group");
-    };
-    let proxy = crate::relay::ProxyEndpoint::from(group);
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| err.to_string())
-        .and_then(|runtime| runtime.block_on(crate::relay::probe(&proxy, &group.test_url)));
+    let proxy = crate::relay::ProxyEndpoint::from(&group);
+    let result = crate::relay::probe(&proxy, &group.test_url).await;
     match result {
         Ok(latency) => Response::ProxyTest {
             latency_ms: latency.as_millis() as u64,
         },
         Err(err) => Response::error(err),
+    }
+}
+
+pub async fn check_proxy(client: Client, group: stemma_core::model::GroupId) -> Response {
+    let group = match configured_group(client, group).await {
+        Ok(group) => group,
+        Err(err) => return Response::error(err),
+    };
+    match crate::relay::check_proxy(&crate::relay::ProxyEndpoint::from(&group)).await {
+        Ok(()) => Response::Ok,
+        Err(err) => Response::error(err),
+    }
+}
+
+async fn configured_group(
+    client: Client,
+    group: stemma_core::model::GroupId,
+) -> Result<stemma_core::config::ProxyGroup, String> {
+    match tokio::task::spawn_blocking(move || client.call(Request::GetConfig)).await {
+        Ok(Response::Config(config)) => config
+            .group(group)
+            .cloned()
+            .ok_or_else(|| "unknown proxy group".into()),
+        Ok(Response::Error { message }) => Err(message),
+        _ => Err("cannot read the configuration".into()),
     }
 }
 

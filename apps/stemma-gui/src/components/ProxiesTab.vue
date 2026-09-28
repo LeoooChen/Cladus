@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { t } from '@/i18n'
-import { ref, computed, onMounted, useId } from 'vue'
+import { ref, computed, onMounted, onUnmounted, useId } from 'vue'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import {
@@ -29,6 +29,7 @@ import {
   deleteProxyGroup,
   migrateProxyGroup,
   testProxyGroup,
+  checkProxyGroup,
 } from '@/api/client'
 import type { ProxyGroup, AutoRule, GroupInUseError, ProxyTestResult } from '@/api/types'
 import { useStatusBus } from '@/composables/useStatusBus'
@@ -41,7 +42,48 @@ const autoRules = ref<AutoRule[]>([])
 const searchQuery = ref('')
 
 // Test results per group
-const testResults = ref(new Map<number, { loading: boolean; result?: ProxyTestResult }>())
+const testResults = ref(new Map<number, { generation: number; loading: boolean; result?: ProxyTestResult }>())
+type Health = { generation: number; signature: string; state: 'checking' | 'up' | 'down'; error?: string }
+const health = ref(new Map<number, Health>())
+let generation = 0
+let disposed = false
+let activeChecks = 0
+const healthQueue: { id: number; generation: number }[] = []
+
+function checkHealth(group: ProxyGroup) {
+  const token = ++generation
+  health.value.set(group.id, { generation: token, signature: JSON.stringify(group), state: 'checking' })
+  healthQueue.push({ id: group.id, generation: token })
+  drainHealthQueue()
+}
+
+function drainHealthQueue() {
+  while (!disposed && activeChecks < 3 && healthQueue.length) {
+    const job = healthQueue.shift()!
+    if (health.value.get(job.id)?.generation !== job.generation) continue
+    activeChecks++
+    void checkProxyGroup(job.id).then(result => {
+      const current = health.value.get(job.id)
+      if (!disposed && current?.generation === job.generation) {
+        health.value.set(job.id, { ...current, state: result.reachable ? 'up' : 'down', error: result.error })
+      }
+    }).catch(error => {
+      const current = health.value.get(job.id)
+      if (!disposed && current?.generation === job.generation) {
+        health.value.set(job.id, { ...current, state: 'down', error: String(error) })
+      }
+    }).finally(() => {
+      activeChecks--
+      drainHealthQueue()
+    })
+  }
+}
+
+function healthLabel(id: number) {
+  const state = health.value.get(id)
+  if (!state || state.state === 'checking') return t('Checking proxy…')
+  return state.state === 'up' ? t('Proxy reachable') : t('Proxy unreachable')
+}
 
 // Editor dialog
 const editOpen = ref(false)
@@ -84,8 +126,21 @@ function rulesForGroup(id: number): AutoRule[] {
 async function fetchData() {
   try {
     const [g, r] = await Promise.all([getProxyGroups(), getAutoRules()])
+    if (disposed) return
     groups.value = g
     autoRules.value = r
+    for (const id of health.value.keys()) {
+      if (!g.some(group => group.id === id)) {
+        health.value.delete(id)
+        testResults.value.delete(id)
+      }
+    }
+    for (const group of g) {
+      if (health.value.get(group.id)?.signature !== JSON.stringify(group)) {
+        testResults.value.delete(group.id)
+        checkHealth(group)
+      }
+    }
   } catch (e) {
     console.error('[ProxiesTab] fetchData failed:', e)
   }
@@ -93,15 +148,19 @@ async function fetchData() {
 
 // Test
 async function onTest(id: number) {
-  testResults.value.set(id, { loading: true })
-  testResults.value = new Map(testResults.value) // trigger reactivity
+  if (testResults.value.get(id)?.loading) return
+  const token = ++generation
+  testResults.value.set(id, { generation: token, loading: true })
   try {
     const result = await testProxyGroup(id)
-    testResults.value.set(id, { loading: false, result })
-  } catch {
-    testResults.value.set(id, { loading: false, result: { error: 'request failed' } })
+    if (!disposed && testResults.value.get(id)?.generation === token) {
+      testResults.value.set(id, { generation: token, loading: false, result })
+    }
+  } catch (error) {
+    if (!disposed && testResults.value.get(id)?.generation === token) {
+      testResults.value.set(id, { generation: token, loading: false, result: { error: String(error) } })
+    }
   }
-  testResults.value = new Map(testResults.value)
 }
 
 // Editor
@@ -138,6 +197,8 @@ async function onSaveGroup() {
     }
     if (editingGroup.value) {
       await updateProxyGroup(editingGroup.value.id, data)
+      health.value.delete(editingGroup.value.id)
+      testResults.value.delete(editingGroup.value.id)
     } else {
       await createProxyGroup(data as Omit<ProxyGroup, 'id'>)
     }
@@ -190,6 +251,10 @@ function toggleExpand(id: number) {
 }
 
 onMounted(fetchData)
+onUnmounted(() => {
+  disposed = true
+  healthQueue.length = 0
+})
 </script>
 
 <template>
@@ -240,6 +305,7 @@ onMounted(fetchData)
             <Badge variant="outline" class="h-5 px-2 text-[10px] font-bold uppercase text-blue-600 border-blue-300 dark:text-blue-400 dark:border-blue-700">SOCKS5</Badge>
             <button
               @click="openEdit(group)"
+              :aria-label="`${t('Edit')}: ${group.name}`"
               class="p-1 rounded text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
             >
               <Pencil class="w-3.5 h-3.5" />
@@ -258,8 +324,17 @@ onMounted(fetchData)
           </div>
 
           <!-- Row 2: address -->
-          <div class="text-sm font-mono text-slate-500 dark:text-slate-400">
-            socks5://{{ group.host }}:{{ group.port }}
+          <div class="flex items-center justify-between gap-2 text-sm font-mono text-slate-500 dark:text-slate-400">
+            <span class="truncate">socks5://{{ group.host }}:{{ group.port }}</span>
+            <button
+              class="shrink-0 p-1 rounded focus-visible:outline-2 focus-visible:outline-blue-500"
+              :aria-label="`${healthLabel(group.id)}: ${group.name}`"
+              :title="health.get(group.id)?.error || `${healthLabel(group.id)}. ${t('Checks the proxy connection only; use the website test below for Internet access.')}`"
+              :disabled="health.get(group.id)?.state === 'checking'"
+              @click="checkHealth(group)"
+            >
+              <span class="block w-2.5 h-2.5 rounded-full" :class="health.get(group.id)?.state === 'up' ? 'bg-emerald-500' : health.get(group.id)?.state === 'down' ? 'bg-red-500' : 'bg-slate-400 animate-pulse'" />
+            </button>
           </div>
 
           <!-- Row 3: test URL + test button + result -->
@@ -275,6 +350,7 @@ onMounted(fetchData)
               <button
                 @click="onTest(group.id)"
                 class="shrink-0 text-sm font-bold px-2 py-0.5 rounded transition-colors"
+                :title="testResults.get(group.id)!.result!.error || t('HTTP response time through the proxy, including TLS')"
                 :class="testResults.get(group.id)!.result!.latency_ms != null
                   ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 hover:bg-emerald-100 dark:hover:bg-emerald-900/40'
                   : 'text-red-500 dark:text-red-400 bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40'"
@@ -282,7 +358,7 @@ onMounted(fetchData)
                 <template v-if="testResults.get(group.id)!.result!.latency_ms != null">
                   {{ testResults.get(group.id)!.result!.latency_ms }}ms
                 </template>
-                <template v-else> {{ t('TIMEOUT') }} </template>
+                <template v-else> {{ t('Test failed') }} </template>
               </button>
             </template>
             <template v-else>

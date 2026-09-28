@@ -76,7 +76,10 @@ where
     .await
 }
 
-async fn negotiate<S>(stream: &mut S, credentials: Option<&Credentials>) -> Result<(), Socks5Error>
+pub(crate) async fn negotiate<S>(
+    stream: &mut S,
+    credentials: Option<&Credentials>,
+) -> Result<(), Socks5Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

@@ -114,9 +114,35 @@ fn run(
         set_level,
     )?;
     let client = controller.client();
-    let handler: ipc::Handler = Arc::new(move |request| match request {
-        Request::TestProxy { group } => stemma_engine::host::test_proxy(&client, group),
-        request => client.call(request),
+    // Reserve capacity for control requests while websites are unresponsive.
+    let probes = Arc::new(tokio::sync::Semaphore::new(4));
+    let handler: ipc::Handler = Arc::new(move |request| {
+        let client = client.clone();
+        let probes = Arc::clone(&probes);
+        Box::pin(async move {
+            let _permit = if matches!(
+                request,
+                Request::TestProxy { .. } | Request::CheckProxy { .. }
+            ) {
+                match probes.try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => return Response::error("proxy checks are busy; retry shortly"),
+                }
+            } else {
+                None
+            };
+            match request {
+                Request::CheckProxy { group } => {
+                    stemma_engine::host::check_proxy(client, group).await
+                }
+                Request::TestProxy { group } => {
+                    stemma_engine::host::test_proxy(client, group).await
+                }
+                request => tokio::task::spawn_blocking(move || client.call(request))
+                    .await
+                    .unwrap_or_else(Response::error),
+            }
+        })
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
