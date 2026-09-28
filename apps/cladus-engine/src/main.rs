@@ -114,6 +114,7 @@ fn default_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// The DNS journal inside a data directory.
+#[cfg(windows)]
 fn dns_journal(data: &Path) -> PathBuf {
     data.join("state").join("dns-journal.json")
 }
