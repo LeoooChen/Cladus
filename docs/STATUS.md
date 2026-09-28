@@ -111,3 +111,24 @@ See CHANGELOG.md for 0.1.1 changes. The 0.1.0 evidence above is historical.
 0.1.1 local package: `target/installer/stemma-0.1.1-windows-x64-setup.exe`,
 7,625,515 bytes. SHA-256:
 `14ab9c4a5f679ca30133e2973374bc42397e8fa50dbeda9ba25c0fe96dc59c54`.
+
+### Installed 0.1.1 follow-up
+
+The user installed 0.1.1. Edge and its descendants were assigned to the correct
+rule, but the preserved configuration still had DNS proxy disabled. The local
+router returned `2001::1` / `185.45.5.35` for Google, while Mihomo TUN supplied
+synthetic IPv4 addresses. After the user's explicit approval, DNS proxy was
+enabled and the original configuration backed up under `%ProgramData%/Stemma`.
+Direct forwarder queries returned Google's actual IPv4/IPv6 addresses.
+
+A temporary, narrowly matched curl test process using the correct Google IP
+still timed out with TUN on: 2 proxy decisions, 0 accepted connections, 0 relays.
+The redirect listener itself remained responsive. After the user disabled TUN,
+the same test using ordinary system DNS succeeded for both families: IPv4 HTTP
+200 (427 ms), IPv6 HTTP 302 (363 ms), with exactly 2 decisions, 2 accepted
+connections, 2 relays and 2 proxied DNS queries. No direct SOCKS proxy option was
+used for those requests: they actually traversed Stemma's WinDivert path.
+
+Temporary diagnostic rules were removed; the user's Edge rule and proxy endpoint
+were preserved. DNS proxy remains enabled. This verifies the installed data path
+without TUN; it does not establish compatibility with simultaneous Mihomo TUN.

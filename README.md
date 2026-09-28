@@ -19,7 +19,10 @@ administrators using their normal UAC token. Standard users who are not members
 of Administrators cannot control the engine.
 
 1. Exit Clew before starting Stemma. The service refuses to engage while Clew
-   runs, because both applications redirect traffic.
+   runs, because both applications redirect traffic. Also turn off the upstream
+   client's TUN mode; keep its SOCKS5 listener running. Stemma supplies per-process
+   routing itself. Mihomo TUN coexistence caused intercepted TCP connections to
+   stall on the tested Windows host, even when the target IP was correct.
 2. Open Stemma and set the SOCKS5 host/port in proxy groups. The default is
    `127.0.0.1:7890`; change it to your proxy. UDP needs UDP ASSOCIATE support.
 3. Add a rule for the executable (e.g. `antigravity.exe`), select its group and
@@ -40,6 +43,10 @@ Proxy**: ordinary browser connections otherwise use system DNS, which may return
 incorrect destination addresses. Restart the affected browser to discard its
 cached DNS and connections. The website latency test uses proxy-side DNS and
 therefore does not by itself verify the browser's system DNS path.
+TUN clients may also supply synthetic DNS addresses (for example `198.18.x.x`);
+after switching from TUN to Stemma, restart affected browsers to discard those
+cached addresses. Stemma's DNS redirection covers active Ethernet/Wi-Fi adapters,
+not another client's TUN adapter.
 
 Opening the GUI engages the engine. Closing the window hides it to the tray
 by default; **Exit** stops proxying, restores DNS and leaves the service idle.
