@@ -363,6 +363,17 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         results.len(),
         env.dir.display()
     );
+    if !failed.is_empty() {
+        for name in ["run1.log", "run2.log", "run3.log"] {
+            if let Ok(log) = fs::read_to_string(env.dir.join(name)) {
+                println!("\n{name} (last 100 lines):");
+                let tail: Vec<_> = log.lines().rev().take(100).collect();
+                for line in tail.into_iter().rev() {
+                    println!("{line}");
+                }
+            }
+        }
+    }
     ensure!(failed.is_empty(), "{} check(s) failed", failed.len());
     Ok(())
 }
