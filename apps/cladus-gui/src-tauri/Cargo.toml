@@ -1,0 +1,40 @@
+[package]
+name = "cladus-gui"
+description = "The Cladus desktop app: an unprivileged Tauri front end for the Cladus Engine service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cladus"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+png = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+cladus-core.workspace = true
+cladus-ipc.workspace = true
+cladus-platform-windows.workspace = true
+sys-locale = "0.3"
+tauri = { version = "2", features = ["tray-icon", "image-png", "custom-protocol"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tokio = { workspace = true, features = ["rt", "time"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

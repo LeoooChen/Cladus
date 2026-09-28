@@ -1,6 +1,6 @@
 ﻿param([string]$Version)
-# Builds the release binaries and the Stemma installer.
-# Output: target/installer/stemma-<version>-windows-x64-setup.exe
+# Builds the release binaries and the Cladus installer.
+# Output: target/installer/cladus-<version>-windows-x64-setup.exe
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $Version) {
@@ -32,14 +32,14 @@ function Get-Dependency($Url, $Name, $Hash = '') {
 Push-Location $root
 try {
     & (Join-Path $PSScriptRoot 'bootstrap-windows.ps1')
-    Push-Location 'apps/stemma-gui'
+    Push-Location 'apps/cladus-gui'
     try {
         & npm ci
         if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
         & npm run build
         if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
     } finally { Pop-Location }
-    & cargo build --release --locked -p stemma-engine -p stemma-gui
+    & cargo build --release --locked -p cladus-engine -p cladus-gui
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
     & node (Join-Path $PSScriptRoot 'package-licenses.mjs')
     if ($LASTEXITCODE -ne 0) { throw 'Dependency license collection failed' }
@@ -54,12 +54,12 @@ try {
         if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
     }
     Get-Dependency 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' 'MicrosoftEdgeWebview2Setup.exe' | Out-Null
-    & $compiler "/DAppVersion=$Version" (Join-Path $root 'installer/stemma.iss')
+    & $compiler "/DAppVersion=$Version" (Join-Path $root 'installer/cladus.iss')
     if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed: $LASTEXITCODE" }
-    $installer = Join-Path $root "target/installer/stemma-$Version-windows-x64-setup.exe"
+    $installer = Join-Path $root "target/installer/cladus-$Version-windows-x64-setup.exe"
     $checksum = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText((Join-Path $root 'target/installer/SHA256SUMS'), "$checksum  $([IO.Path]::GetFileName($installer))`n")
-    Write-Host "Installer: target/installer/stemma-$Version-windows-x64-setup.exe"
+    Write-Host "Installer: target/installer/cladus-$Version-windows-x64-setup.exe"
 } finally {
     Pop-Location
 }

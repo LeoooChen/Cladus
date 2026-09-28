@@ -1,4 +1,4 @@
-# cargo-deny policy. Stemma is MIT-licensed; everything compiled into its
+# cargo-deny policy. Cladus is MIT-licensed; everything compiled into its
 # binaries must be compatible with shipping under MIT.
 #
 # WinDivert (LGPL-3.0 / GPL-2.0) is deliberately NOT a Rust dependency: it is

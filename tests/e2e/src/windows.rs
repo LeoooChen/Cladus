@@ -1,4 +1,4 @@
-//! End-to-end acceptance test for `stemma-engine` (Windows, administrator).
+//! End-to-end acceptance test for `cladus-engine` (Windows, administrator).
 //!
 //! The test runs the real engine with WinDivert and ETW against a local test
 //! SOCKS5 server. Probe processes connect to TEST-NET-3 addresses
@@ -19,11 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
+use cladus_core::config::{Config, ProxyGroup, Rule, RuleProtocol};
+use cladus_core::model::GroupId;
 use clap::{Args, Parser, Subcommand};
-use stemma_core::config::{Config, ProxyGroup, Rule, RuleProtocol};
-use stemma_core::model::GroupId;
 
-const MARKER: &str = "STEMMA-E2E";
+const MARKER: &str = "CLADUS-E2E";
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Probe exit code when the connection failed, i.e. it was not redirected.
 const EXIT_NOT_REDIRECTED: u8 = 3;
@@ -31,8 +31,8 @@ const EXIT_WRONG_ANSWER: u8 = 4;
 
 #[derive(Parser)]
 #[command(
-    name = "stemma-e2e",
-    about = "End-to-end acceptance test for stemma-engine"
+    name = "cladus-e2e",
+    about = "End-to-end acceptance test for cladus-engine"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,7 +49,7 @@ enum Cmd {
 
 #[derive(Args, Default)]
 struct RunArgs {
-    /// stemma-engine executable [default: next to this program].
+    /// cladus-engine executable [default: next to this program].
     #[arg(long)]
     engine: Option<PathBuf>,
     /// Directory with WinDivert.dll and WinDivert64.sys [default: third_party/windivert].
@@ -206,7 +206,7 @@ struct Env {
 
 fn run(args: RunArgs) -> anyhow::Result<()> {
     ensure!(
-        stemma_platform_windows::is_elevated(),
+        cladus_platform_windows::is_elevated(),
         "run this test from an administrator prompt"
     );
     let ipv6 = args.ipv6;
@@ -224,7 +224,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     check(
         "a second engine cannot disturb the running engine",
         match EngineProcess::start(&env, "duplicate") {
-            Err(err) if err.to_string().contains("another Stemma engine") => Ok(()),
+            Err(err) if err.to_string().contains("another Cladus engine") => Ok(()),
             Err(err) => Err(err),
             Ok(_) => Err(anyhow::anyhow!("a second engine started")),
         },
@@ -372,7 +372,7 @@ fn prepare(args: RunArgs) -> anyhow::Result<Env> {
     let bin_dir = me.parent().context("no program directory")?.to_owned();
     let engine = args
         .engine
-        .unwrap_or_else(|| bin_dir.join("stemma-engine.exe"));
+        .unwrap_or_else(|| bin_dir.join("cladus-engine.exe"));
     ensure!(
         engine.is_file(),
         "{} not found; build it first",
@@ -387,7 +387,7 @@ fn prepare(args: RunArgs) -> anyhow::Result<Env> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("stemma-e2e-{}-{stamp}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cladus-e2e-{}-{stamp}", std::process::id()));
     fs::create_dir_all(&dir)?;
     let copy = |name: &str| -> anyhow::Result<PathBuf> {
         let path = dir.join(name);
@@ -399,11 +399,11 @@ fn prepare(args: RunArgs) -> anyhow::Result<Env> {
         engine,
         windivert,
         config: dir.join("config.json"),
-        matched: copy("stemma_probe.exe")?,
-        child: copy("stemma_child.exe")?,
-        grandchild: copy("stemma_grandchild.exe")?,
-        unmatched: copy("stemma_control.exe")?,
-        udp_only: copy("stemma_udponly.exe")?,
+        matched: copy("cladus_probe.exe")?,
+        child: copy("cladus_child.exe")?,
+        grandchild: copy("cladus_grandchild.exe")?,
+        unmatched: copy("cladus_control.exe")?,
+        udp_only: copy("cladus_udponly.exe")?,
         server,
         dir,
     };
@@ -425,7 +425,7 @@ fn prepare(args: RunArgs) -> anyhow::Result<Env> {
         rules: vec![
             rule("probe", &env.matched, RuleProtocol::Tcp),
             Rule {
-                dst_filter: stemma_core::config::DestinationFilter {
+                dst_filter: cladus_core::config::DestinationFilter {
                     exclude_cidrs: vec![
                         "203.0.113.99".parse().unwrap(),
                         "2001:db8::99".parse().unwrap(),
@@ -498,7 +498,7 @@ impl EngineProcess {
             .stdout(log_file.try_clone()?)
             .stderr(log_file)
             .spawn()
-            .context("starting stemma-engine")?;
+            .context("starting cladus-engine")?;
         let mut engine = Self {
             child,
             stop_file,

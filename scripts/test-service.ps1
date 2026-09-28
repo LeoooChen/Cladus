@@ -10,9 +10,9 @@ $root = Split-Path -Parent $PSScriptRoot
 if (-not $TestDirectory) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $TestDirectory = Join-Path $root "target\service-test-$stamp"
-    $DataDirectory = Join-Path $env:ProgramData "Stemma-test-$stamp"
+    $DataDirectory = Join-Path $env:ProgramData "Cladus-test-$stamp"
 }
-$exe = Join-Path $TestDirectory 'stemma-engine.exe'
+$exe = Join-Path $TestDirectory 'cladus-engine.exe'
 $log = Join-Path $TestDirectory "$Phase.log"
 New-Item -ItemType Directory -Path $TestDirectory -Force | Out-Null
 
@@ -39,10 +39,10 @@ if ($Phase -ne 'Run') {
     try {
         switch ($Phase) {
             'Setup' {
-                if (Get-Service -Name StemmaEngine -ErrorAction SilentlyContinue) {
-                    throw 'A Stemma service already exists; this test will not replace it.'
+                if (Get-Service -Name CladusEngine -ErrorAction SilentlyContinue) {
+                    throw 'A Cladus service already exists; this test will not replace it.'
                 }
-                Copy-Item -LiteralPath (Join-Path $root 'target\debug\stemma-engine.exe') -Destination $exe
+                Copy-Item -LiteralPath (Join-Path $root 'target\debug\cladus-engine.exe') -Destination $exe
                 & $exe install --data-dir $DataDirectory --windivert-dir (Join-Path $root 'third_party\windivert') >> $log 2>&1
                 if ($LASTEXITCODE -ne 0) { throw 'Service installation failed' }
                 & $exe start >> $log 2>&1
@@ -50,7 +50,7 @@ if ($Phase -ne 'Run') {
                 'Setup passed' | Out-File -LiteralPath $log -Append
             }
             'Crash' {
-                $service = Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'"
+                $service = Get-CimInstance Win32_Service -Filter "Name='CladusEngine'"
                 $process = Get-Process -Id $service.ProcessId
                 if ($process.Path -ne $exe) { throw 'Refusing to kill an unrelated service process' }
                 $oldId = $process.Id
@@ -58,7 +58,7 @@ if ($Phase -ne 'Run') {
                 $deadline = (Get-Date).AddSeconds(25)
                 do {
                     Start-Sleep -Milliseconds 250
-                    $service = Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'"
+                    $service = Get-CimInstance Win32_Service -Filter "Name='CladusEngine'"
                 } while (($service.State -ne 'Running' -or $service.ProcessId -eq $oldId) -and (Get-Date) -lt $deadline)
                 if ($service.State -ne 'Running' -or $service.ProcessId -eq $oldId) {
                     throw 'SCM did not restart the crashed service'
@@ -66,7 +66,7 @@ if ($Phase -ne 'Run') {
                 'Crash recovery passed' | Out-File -LiteralPath $log -Append
             }
             'Cleanup' {
-                $service = Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'"
+                $service = Get-CimInstance Win32_Service -Filter "Name='CladusEngine'"
                 if ($service -and ($service.PathName.StartsWith('"' + $exe + '"') -or $service.PathName.StartsWith($exe + ' '))) {
                     & $exe uninstall >> $log 2>&1
                     if ($LASTEXITCODE -ne 0) { throw 'Service uninstall failed' }
@@ -83,7 +83,7 @@ if ($Phase -ne 'Run') {
 
 Push-Location $root
 try {
-    & cargo build -p stemma-engine
+    & cargo build -p cladus-engine
     if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
     Invoke-AdminPhase 'Setup'
     Start-Sleep -Milliseconds 500

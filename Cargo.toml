@@ -1,26 +1,26 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/stemma-core",
-    "crates/stemma-platform-windows",
-    "crates/stemma-ipc",
-    "apps/stemma-engine",
-    "apps/stemma-gui/src-tauri",
+    "crates/cladus-core",
+    "crates/cladus-platform-windows",
+    "crates/cladus-ipc",
+    "apps/cladus-engine",
+    "apps/cladus-gui/src-tauri",
     "tests/e2e",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
-authors = ["Stemma contributors"]
+authors = ["Cladus contributors"]
 publish = false
 
 [workspace.dependencies]
-stemma-core = { version = "0.1.0", path = "crates/stemma-core" }
-stemma-platform-windows = { version = "0.1.0", path = "crates/stemma-platform-windows" }
-stemma-ipc = { version = "0.1.0", path = "crates/stemma-ipc" }
+cladus-core = { version = "0.1.0", path = "crates/cladus-core" }
+cladus-platform-windows = { version = "0.1.0", path = "crates/cladus-platform-windows" }
+cladus-ipc = { version = "0.1.0", path = "crates/cladus-ipc" }
 
 anyhow = "1.0.100"
 arc-swap = "1.7"

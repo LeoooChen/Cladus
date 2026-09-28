@@ -24,10 +24,10 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: apps/stemma-gui/package-lock.json
+          cache-dependency-path: apps/cladus-gui/package-lock.json
       - name: Frontend typecheck and build
         if: runner.os == 'Windows'
-        working-directory: apps/stemma-gui
+        working-directory: apps/cladus-gui
         run: |
           npm ci
           npm run build
@@ -39,7 +39,7 @@ jobs:
         run: ./scripts/check-layering.ps1
       - name: Frontend localization tests (mocked host)
         if: runner.os == 'Windows'
-        working-directory: apps/stemma-gui
+        working-directory: apps/cladus-gui
         run: |
           npx playwright install chromium
           npx playwright test --workers=2
@@ -62,7 +62,7 @@ jobs:
         # The version comes from Cargo.toml; a release tag must match it.
         run: |
           ./scripts/package-windows.ps1
-          if ('${{ github.ref }}'.StartsWith('refs/tags/v') -and -not (Test-Path "target/installer/stemma-$('${{ github.ref_name }}'.Substring(1))-windows-x64-setup.exe")) {
+          if ('${{ github.ref }}'.StartsWith('refs/tags/v') -and -not (Test-Path "target/installer/cladus-$('${{ github.ref_name }}'.Substring(1))-windows-x64-setup.exe")) {
             throw 'The tag does not match the workspace version'
           }
       - name: Installer acceptance tests

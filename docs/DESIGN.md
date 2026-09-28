@@ -1,7 +1,7 @@
-# Stemma · 设计方案
+# Cladus · 设计方案
 
 > 状态：**方案已确认（2026-09-26）**，按 §13 分阶段实施。
-> Stemma 是 Windows 进程级流量代理 Clew 的 Rust 重写版，作为独立产品发布，不再沿用 Clew 的名称。
+> Cladus 是 Windows 进程级流量代理 Clew 的 Rust 重写版，作为独立产品发布，不再沿用 Clew 的名称。
 > 参考实现：`reference/clew-cpp`（LeoooChen/clew-proxy @ a895b9e，含 fork 的语言切换 / HiDPI / 安装器改动；不纳入本仓库版本控制）。
 > 原则：稳定 > 简单 > 可维护 > 跨平台演进 > 与旧代码结构一致（最后一项不追求）。
 
@@ -13,23 +13,23 @@
 | GUI | Tauri 2 + 复用 Vue 3 前端 |
 | 托盘“退出” | 停止代理并恢复 DNS；服务回到空闲常驻 |
 | 仓库 | 全新独立仓库 |
-| 命名 | 一律使用 Stemma（见下表） |
+| 命名 | 一律使用 Cladus（见下表） |
 
 **命名表**
 
 | 对象 | 名称 |
 |---|---|
-| 产品 / 窗口标题 | Stemma |
-| GUI 可执行文件 | `stemma.exe` |
-| 引擎可执行文件 | `stemma-engine.exe` |
-| Windows 服务 | `StemmaEngine`（显示名 “Stemma Engine”） |
-| 命名管道 | `\\.\pipe\StemmaEngine` |
-| ETW 会话 | `StemmaProcessEtw` |
-| 数据目录 | `%ProgramData%\Stemma`、`%APPDATA%\Stemma`、`%LOCALAPPDATA%\Stemma` |
-| 自启注册表值 | `HKCU\...\Run\Stemma` |
-| 安装程序 | `stemma-X.Y.Z-windows-x64-setup.exe`，AppId `{773C5C77-A7AE-402D-AC63-19F8574CC2F3}` |
-| Rust crate | `stemma-core`、`stemma-net`、`stemma-ipc`、`stemma-engine`、`stemma-platform-windows`；应用 `apps/stemma-engine`、`apps/stemma-gui` |
-| 日志前缀 / 环境变量 | `STEMMA_LOG`、`STEMMA_DEV_URL` |
+| 产品 / 窗口标题 | Cladus |
+| GUI 可执行文件 | `cladus.exe` |
+| 引擎可执行文件 | `cladus-engine.exe` |
+| Windows 服务 | `CladusEngine`（显示名 “Cladus Engine”） |
+| 命名管道 | `\\.\pipe\CladusEngine` |
+| ETW 会话 | `CladusProcessEtw` |
+| 数据目录 | `%ProgramData%\Cladus`、`%APPDATA%\Cladus`、`%LOCALAPPDATA%\Cladus` |
+| 自启注册表值 | `HKCU\...\Run\Cladus` |
+| 安装程序 | `cladus-X.Y.Z-windows-x64-setup.exe`，AppId `{A931F2F9-36B8-4C52-9C9B-76AC7B86E1A3}` |
+| Rust crate | `cladus-core`、`cladus-net`、`cladus-ipc`、`cladus-engine`、`cladus-platform-windows`；应用 `apps/cladus-engine`、`apps/cladus-gui` |
+| 日志前缀 / 环境变量 | `CLADUS_LOG`、`CLADUS_DEV_URL` |
 
 ---
 
@@ -37,16 +37,16 @@
 
 | 议题 | 结论 |
 |---|---|
-| 进程模型 | `stemma-engine.exe` 作为 Windows 服务（LocalSystem）负责 WinDivert / ETW / DNS / 转发；`stemma.exe`（GUI）以普通用户权限运行，两者通过命名管道 IPC 通信。GUI 永不提权，开机自启不需要计划任务，也不会弹 UAC。 |
+| 进程模型 | `cladus-engine.exe` 作为 Windows 服务（LocalSystem）负责 WinDivert / ETW / DNS / 转发；`cladus.exe`（GUI）以普通用户权限运行，两者通过命名管道 IPC 通信。GUI 永不提权，开机自启不需要计划任务，也不会弹 UAC。 |
 | 流量截获 | **继续使用 WinDivert 2.2.2**（双层：SOCKET 层做决策 + NETWORK 层反射），完整保留 SYN parking 设计。**不使用** LGPL 的 `windivert` / `windivert-sys` crate，改为自写约 200 行 FFI，运行时动态加载 `WinDivert.dll`，主项目保持 MIT。 |
 | 进程追踪 | **继续使用 ETW Microsoft-Windows-Kernel-Process**（Start/Stop/Rundown + EventsLost 重同步），基于 `windows` crate 手写（移植已验证的 C++ 逻辑）。 |
 | 核心并发 | 单线程“决策核心”actor 独占进程树和规则引擎（对应 C++ 的 strand），用**带优先级的通道**保证 CONNECT 决策优先于 ETW 突发；NETWORK 层 worker 只读原子量，从不阻塞在核心上；中继、UDP、DNS、IPC 运行在 tokio 上。 |
 | GUI | Tauri 2 + 迁移现有 Vue 3 前端（已有中英文 i18n、Playwright 测试、HiDPI 行为）。没有内置 HTTP 服务器，也没有手写 WebView2 COM 宿主。 |
 | 异步 / 日志 / 配置 | tokio · tracing（滚动文件、运行时调级）· serde_json（schema v3，可导入 Clew 的 `clew.json` v2） |
 | IPC | 命名管道，长度前缀 JSON 帧，版本握手；管道 DACL + 服务端校验“调用者是本机 Administrators 组成员（无需提权）”。 |
-| 数据目录 | 引擎配置 / 状态 / 日志放 `%ProgramData%\Stemma`（受保护 DACL）；UI 偏好放 `%APPDATA%\Stemma`；WebView2 缓存和 GUI 日志放 `%LOCALAPPDATA%\Stemma`。**安装目录只读，只放程序文件。** |
+| 数据目录 | 引擎配置 / 状态 / 日志放 `%ProgramData%\Cladus`（受保护 DACL）；UI 偏好放 `%APPDATA%\Cladus`；WebView2 缓存和 GUI 日志放 `%LOCALAPPDATA%\Cladus`。**安装目录只读，只放程序文件。** |
 | 崩溃恢复 | WinDivert 句柄随进程退出由内核释放（fail-open）；DNS 采用**预写日志（journal）**，在服务启动、停止、SCM 自动重启、卸载时恢复；启动时清理残留 ETW 会话。 |
-| 安装器 | Inno Setup（沿用 fork 已验证的流程、中文翻译、CI 安装 / 升级 / 卸载测试）；新 AppId；可导入已安装 Clew 的配置。 |
+| 安装器 | Inno Setup（沿用 fork 已验证的流程、中文翻译、CI 安装 / 升级 / 卸载测试）；新 AppId；首次安装使用全新的 Cladus 配置，不检测或迁移其他产品。 |
 | 许可证 | MIT。cargo-deny 白名单：MIT / Apache-2.0 / BSD / ISC / Zlib / Unicode；MPL-2.0 只允许作为未修改的传递依赖（Tauri 的 cssparser/selectors）；禁止 GPL / LGPL / AGPL 被编进二进制（WinDivert 以独立 DLL 动态加载，另行附带许可证）。设计与算法源自 Clew（MIT, © 2026 ymonster），在 `THIRD_PARTY_NOTICES.md` 中保留其许可声明与致谢。 |
 
 ---
@@ -94,16 +94,16 @@ main → app（组合根，约 30 个成员，析构时显式按序关闭）
 
 **UI**：HTTP 负责 CRUD；推送走 `PostWebMessageAsJson`；窗口隐藏时后端完全停止构建快照。
 
-### 1.3 fork 的改动（Stemma 必须具备，不能回退）
+### 1.3 fork 的改动（Cladus 必须具备，不能回退）
 
 - 界面语言：跟随系统 / 简体中文 / English，持久化保存；切换时刷新 UI 并回到设置页，引擎不中断；Monaco 使用中文 nls；未保存的 JSON 编辑需要确认才丢弃；托盘菜单和原生错误框也本地化。
 - HiDPI：PerMonitorV2 manifest；WebView 跟随显示器缩放，不做二次缩放；窗口宽高按 96-DPI 逻辑像素保存，位置按桌面像素保存（支持负坐标）；恢复时夹紧到工作区；处理 `WM_DPICHANGED` 建议矩形；最小尺寸随 DPI 缩放；进程图标 32px 源像素。
 - 文件对话框为 Unicode，路径长度不受 MAX_PATH 限制。
 - 安装器与发布：Inno Setup（固定 SHA-256）、中英文安装界面、按需安装运行库、卸载只删除属于本安装的自启项；CI 在中文路径下测试安装 / 升级 / 卸载并验证配置保留；打 tag 后先通过全部测试，再由独立的 release job 发布 EXE。
 
-### 1.4 审阅中发现的问题（Stemma 修复，不照搬）
+### 1.4 审阅中发现的问题（Cladus 修复，不照搬）
 
-| # | 问题 | 位置 | Stemma 处理 |
+| # | 问题 | 位置 | Cladus 处理 |
 |---|---|---|---|
 | D1 | **TCP 决策不检查规则的 protocol**：只看 `is_proxied()`，“UDP only”规则同样会代理 TCP | `windivert_socket::decide` | 每个进程的 Assignment 携带协议集合，TCP / UDP 分别判断 |
 | D2 | 规则状态以裸 PID 为键，PID 回收窗口内会误继承（文档已记为 known residual） | `rule_engine_v3` | 以 `ProcessKey(pid, instance)` 为键；继承在插入时从父节点 O(1) 取得 |
@@ -144,20 +144,20 @@ main → app（组合根，约 30 个成员，析构时显式按序关闭）
 
 ```
 ┌──────────────── 用户会话（标准权限 asInvoker）────────────────┐
-│ stemma.exe  — Tauri 2（WebView2 + Vue UI）                       │
+│ cladus.exe  — Tauri 2（WebView2 + Vue UI）                       │
 │   托盘 / 窗口 / 自启(HKCU Run) / 语言 / 图标提取 / 文件对话框    │
-│   %APPDATA%\Stemma\ui.json   %LOCALAPPDATA%\Stemma\{logs,WebView2}│
+│   %APPDATA%\Cladus\ui.json   %LOCALAPPDATA%\Cladus\{logs,WebView2}│
 └───────────────┬─────────────────────────────────────────────────┘
-                │  \\.\pipe\StemmaEngine  (协议 v1, JSON 帧, 请求/响应 + 订阅推送)
+                │  \\.\pipe\CladusEngine  (协议 v1, JSON 帧, 请求/响应 + 订阅推送)
 ┌───────────────┴──────── Session 0 · LocalSystem ────────────────┐
-│ stemma-engine.exe — Windows 服务 StemmaEngine（自动启动，默认空闲）│
+│ cladus-engine.exe — Windows 服务 CladusEngine（自动启动，默认空闲）│
 │   决策核心 actor ◄── ETW 线程                                    │
 │        ▲  ▲                                                      │
 │        │  └── WinDivert SOCKET 线程(TCP/UDP) ── PortTracker ──┐  │
 │        │                                   NETWORK workers ◄──┘  │
 │        │                                   SYN 注入/看门狗线程    │
 │   tokio: acceptor+relay │ UDP relay │ DNS forwarder │ IPC │ 配置  │
-│   %ProgramData%\Stemma\{config.json, state\, logs\}（受保护 DACL）│
+│   %ProgramData%\Cladus\{config.json, state\, logs\}（受保护 DACL）│
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,7 +169,7 @@ main → app（组合根，约 30 个成员，析构时显式按序关闭）
 
 **引擎生命周期**：
 - 服务开机启动但处于**空闲**：不加载 WinDivert，不开 ETW，只做 DNS journal 恢复检查。
-- GUI 启动后发送 `Engage`，引擎开始工作；托盘点“退出” → `Disengage`（恢复 DNS、关闭 WinDivert），然后 GUI 退出。退出 Stemma 即停止代理。
+- GUI 启动后发送 `Engage`，引擎开始工作；托盘点“退出” → `Disengage`（恢复 DNS、关闭 WinDivert），然后 GUI 退出。退出 Cladus 即停止代理。
 - GUI 异常断开时引擎继续运行；GUI 重连后恢复显示。（以后可加“无 UI 常驻”选项。）
 - 与 Clew 互斥：Engage 前检测 `Global\Clew_SingleInstance`，存在则拒绝并提示“请先退出 Clew”（两者同时反射会冲突）。
 
@@ -179,12 +179,12 @@ main → app（组合根，约 30 个成员，析构时显式按序关闭）
 
 | 内容 | 位置 | 所有者 / ACL | 说明 |
 |---|---|---|---|
-| 程序文件 | `%ProgramFiles%\Stemma\` | 安装器（管理员）；Users 只读 | 只含 exe、WinDivert.dll/.sys、licenses。自定义安装路径时由安装器设置受保护 DACL，防止标准用户替换服务 exe |
-| 引擎配置 | `%ProgramData%\Stemma\config.json`（+ `.bak`） | **受保护 DACL**：SYSTEM、Administrators 完全控制，Users 无权限 | 服务读写；GUI 只经 IPC 访问。服务启动时校验目录所有者 / DACL，防止被预先植入 |
-| 运行状态 | `%ProgramData%\Stemma\state\dns-journal.json` | 同上 | 预写日志：先写 journal 再改系统，校验恢复成功后才删除 |
-| 引擎日志 | `%ProgramData%\Stemma\logs\engine.log*` | 同上（Users 可读） | 按大小滚动，保留 5 个；级别可运行时调整 |
-| UI 偏好 | `%APPDATA%\Stemma\ui.json` | 当前用户 | 语言、主题、窗口几何、关闭到托盘、最小化启动 |
-| GUI 日志 / WebView2 数据 | `%LOCALAPPDATA%\Stemma\{logs,WebView2}` | 当前用户 | 避免 Program Files 下 WebView2 报 0x800700aa |
+| 程序文件 | `%ProgramFiles%\Cladus\` | 安装器（管理员）；Users 只读 | 只含 exe、WinDivert.dll/.sys、licenses。自定义安装路径时由安装器设置受保护 DACL，防止标准用户替换服务 exe |
+| 引擎配置 | `%ProgramData%\Cladus\config.json`（+ `.bak`） | **受保护 DACL**：SYSTEM、Administrators 完全控制，Users 无权限 | 服务读写；GUI 只经 IPC 访问。服务启动时校验目录所有者 / DACL，防止被预先植入 |
+| 运行状态 | `%ProgramData%\Cladus\state\dns-journal.json` | 同上 | 预写日志：先写 journal 再改系统，校验恢复成功后才删除 |
+| 引擎日志 | `%ProgramData%\Cladus\logs\engine.log*` | 同上（Users 可读） | 按大小滚动，保留 5 个；级别可运行时调整 |
+| UI 偏好 | `%APPDATA%\Cladus\ui.json` | 当前用户 | 语言、主题、窗口几何、关闭到托盘、最小化启动 |
+| GUI 日志 / WebView2 数据 | `%LOCALAPPDATA%\Cladus\{logs,WebView2}` | 当前用户 | 避免 Program Files 下 WebView2 报 0x800700aa |
 
 **需要特权的操作全部在服务里执行**：WinDivert 驱动加载、ETW 内核 provider、`SetInterfaceDnsSettings`、读取其他会话进程的 cmdline。
 
@@ -192,23 +192,23 @@ main → app（组合根，约 30 个成员，析构时显式按序关闭）
 - 管道 DACL：SYSTEM、Administrators、INTERACTIVE。
 - 服务端逐连接校验：`ImpersonateNamedPipeClient` 取令牌 → 已提权管理员直接通过 → 受限令牌取 `TokenLinkedToken` 后 `CheckTokenMembership(Administrators)`。**即本机管理员组成员，无需提权**即可控制引擎，与原“必须 UAC 提权”安全边界等价，但不弹窗。
 - 非管理员：拒绝连接（以后可扩展为只读）。
-- GUI 用 `GetNamedPipeServerProcessId` 校验服务端就是 StemmaEngine 服务进程，防止管道抢注。
+- GUI 用 `GetNamedPipeServerProcessId` 校验服务端就是 CladusEngine 服务进程，防止管道抢注。
 
 **加固**：服务启动后立即 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`，用完整路径加载 WinDivert.dll；服务 SID 类型 unrestricted；最小特权集合作为后续加固项。
 
-**开机启动**：GUI 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Stemma = "<安装目录>\stemma.exe" --autostart`；按 UI 偏好决定是否只显示托盘。全程不提权。GUI 每次启动校验该值指向当前 exe，不一致就修正。
+**开机启动**：GUI 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Cladus = "<安装目录>\cladus.exe" --autostart`；按 UI 偏好决定是否只显示托盘。全程不提权。GUI 每次启动校验该值指向当前 exe，不一致就修正。
 
 ---
 
 ## 5. 目录结构与模块边界
 
 ```
-Stemma/                          # 仓库根
+Cladus/                          # 仓库根
 ├─ Cargo.toml                    # workspace；统一版本、lints、profile
 ├─ rust-toolchain.toml
 ├─ deny.toml / about.toml        # 许可证 / 漏洞策略；第三方声明生成
 ├─ crates/
-│  ├─ stemma-core/               # 纯领域逻辑，不含 IO、平台代码和 tokio
+│  ├─ cladus-core/               # 纯领域逻辑，不含 IO、平台代码和 tokio
 │  │   ├─ model                  # ProcessKey, ProcessInfo, GroupId, RuleId, Verdict, FlowQuery …
 │  │   ├─ config                 # schema v3、校验、Clew v2 导入
 │  │   ├─ tree                   # 进程树（arena + 父子索引、孤儿、墓碑压缩）
@@ -216,18 +216,18 @@ Stemma/                          # 仓库根
 │  │   ├─ policy                 # 目的过滤（CIDR v4/v6、端口），决策与显示共用
 │  │   ├─ decision               # 决策核心状态机（同步可测）
 │  │   └─ platform               # ★平台 trait（见 §6）
-│  ├─ stemma-net/                # SOCKS5 TCP/UDP 客户端、TCP relay、UDP 会话、DNS forwarder（tokio）
-│  ├─ stemma-ipc/                # IPC 协议类型、帧编解码、版本；传输按 cfg 切换 Named Pipe / UDS
-│  ├─ stemma-engine/             # 组合根：actor 线程、生命周期、配置存储、DNS journal、统计；只依赖 trait
-│  └─ stemma-platform-windows/   # 唯一可以 `use windows::…` 的地方
+│  ├─ cladus-net/                # SOCKS5 TCP/UDP 客户端、TCP relay、UDP 会话、DNS forwarder（tokio）
+│  ├─ cladus-ipc/                # IPC 协议类型、帧编解码、版本；传输按 cfg 切换 Named Pipe / UDS
+│  ├─ cladus-engine/             # 组合根：actor 线程、生命周期、配置存储、DNS journal、统计；只依赖 trait
+│  └─ cladus-platform-windows/   # 唯一可以 `use windows::…` 的地方
 │      ├─ divert/                # FFI（运行时加载）、TCP/UDP SOCKET/NETWORK、PortTracker、SYN parker
 │      ├─ etw.rs  process.rs  dns.rs  conntable.rs
 │      ├─ service.rs             # 服务宿主、安装/卸载/恢复策略
 │      └─ security.rs            # 管道 DACL、令牌校验、目录 DACL
 ├─ apps/
-│  ├─ stemma-engine/             # bin：service | console | install | uninstall | start | stop | restore-dns | status
-│  └─ stemma-gui/                # Tauri 2：src-tauri/ + frontend/（从 Clew 迁移的 Vue 3）
-├─ installer/                    # stemma.iss、ChineseSimplified.isl
+│  ├─ cladus-engine/             # bin：service | console | install | uninstall | start | stop | restore-dns | status
+│  └─ cladus-gui/                # Tauri 2：src-tauri/ + frontend/（从 Clew 迁移的 Vue 3）
+├─ installer/                    # cladus.iss、ChineseSimplified.isl
 ├─ scripts/                      # bootstrap（WinDivert 固定哈希）、package、test-installer、release.py、check-layering
 ├─ tests/e2e/                    # 需管理员权限的端到端测试（内置 SOCKS5 测试服务器）
 ├─ docs/                         # DESIGN.md、ARCHITECTURE.md、TROUBLESHOOTING
@@ -236,20 +236,20 @@ Stemma/                          # 仓库根
 
 **依赖方向（CI 检查强制）**：
 ```
-stemma-core ← stemma-net ← stemma-engine ← apps/stemma-engine
+cladus-core ← cladus-net ← cladus-engine ← apps/cladus-engine
      ↑                          ↑                ↑
-     └──── stemma-platform-windows ──────────────┘
-stemma-ipc ← stemma-engine, apps/stemma-gui
+     └──── cladus-platform-windows ──────────────┘
+cladus-ipc ← cladus-engine, apps/cladus-gui
 ```
-- `stemma-core` 禁止依赖 tokio、windows 和任何 IO（可在 Linux CI 上跑单测）。
-- `stemma-net` / `stemma-engine` 禁止依赖 `windows` crate。
-- 平台代码只出现在 `stemma-platform-*` 和 GUI 的 `cfg(windows)` 模块里。
+- `cladus-core` 禁止依赖 tokio、windows 和任何 IO（可在 Linux CI 上跑单测）。
+- `cladus-net` / `cladus-engine` 禁止依赖 `windows` crate。
+- 平台代码只出现在 `cladus-platform-*` 和 GUI 的 `cfg(windows)` 模块里。
 
 ---
 
 ## 6. 平台抽象设计
 
-### 6.1 核心 trait（`stemma-core::platform`）
+### 6.1 核心 trait（`cladus-core::platform`）
 
 ```rust
 /// 跨平台进程身份。instance：Windows=PSN，Linux=starttime，macOS=p_uniqueid
@@ -387,30 +387,30 @@ SOCKET 查询(TCP/UDP 线程) ─(最高优先)──┤──► 决策核心�
 1. **fail-open**：任何致命错误都先关闭 WinDivert 句柄（流量立即恢复直连）。进程被强杀时内核也会释放句柄。
 2. **panic 策略**：release 使用 `panic = "abort"`，panic hook 记日志、尽力恢复 DNS 后退出；SCM 恢复策略 5s / 10s / 30s 重启服务，服务启动时根据 journal 恢复 DNS。
 3. **看门狗**：NETWORK worker 心跳；有积压但超过阈值无进展 → 关闭句柄并告警。
-4. **DNS journal**：先写 journal（fsync + 原子 rename）再改系统；恢复后回读确认一致才删除。触发点：服务启动、Disengage、服务停止、panic hook、卸载、`stemma-engine restore-dns`。
+4. **DNS journal**：先写 journal（fsync + 原子 rename）再改系统；恢复后回读确认一致才删除。触发点：服务启动、Disengage、服务停止、panic hook、卸载、`cladus-engine restore-dns`。
 5. **DNS 可用性**：上游经代理连续失败时回退到原 DNS（默认）或严格模式不回退，都在 UI 告警。转发器同时处理 UDP 和 TCP。
-6. **ETW 会话残留**：启动时停止 `StemmaProcessEtw`；卸载时再清理一次。
+6. **ETW 会话残留**：启动时停止 `CladusProcessEtw`；卸载时再清理一次。
 7. **配置安全写入**：临时文件 → flush → `ReplaceFileW`，保留 `.bak`；解析失败时拒绝加载并在 UI 报告，绝不静默覆盖。
 
 ---
 
 ## 10. 安装 / 升级 / 卸载
 
-**安装目录内容**：`stemma.exe`、`stemma-engine.exe`、`WinDivert.dll`、`WinDivert64.sys`、`licenses\*`、`unins000.exe/.dat`。静态 CRT，无需 VC++ redist；前端资源内嵌；WebView2 Runtime 按需安装（Win11 自带）。
+**安装目录内容**：`cladus.exe`、`cladus-engine.exe`、`WinDivert.dll`、`WinDivert64.sys`、`licenses\*`、`unins000.exe/.dat`。静态 CRT，无需 VC++ redist；前端资源内嵌；WebView2 Runtime 按需安装（Win11 自带）。
 
 **安装 / 升级**：
-1. `PrepareToInstall`：若服务已存在，执行 `stemma-engine stop --for-upgrade`（恢复 DNS、关闭 WinDivert），并通知 GUI 退出；检测到 Clew 正在运行则提示先退出 Clew。
-2. 复制文件，执行 `stemma-engine install`：创建服务（自动启动、描述、恢复策略、SID 类型）、创建受保护 DACL 的 `%ProgramData%\Stemma`。
-3. **首次安装时导入 Clew 配置（可选）**：从 Clew 卸载项 `{B4030D7C-ED32-4DA1-936E-944411E77496}_is1` 的 InstallLocation 找到 `clew.json`，勾选“导入 Clew 的规则与代理组”后转换为 Stemma v3 配置（只读源文件，不修改 Clew 安装）。
+1. `PrepareToInstall`：若服务已存在，执行 `cladus-engine stop --for-upgrade`（恢复 DNS、关闭 WinDivert），并通知 GUI 退出；检测到 Clew 正在运行则提示先退出 Clew。
+2. 复制文件，执行 `cladus-engine install`：创建服务（自动启动、描述、恢复策略、SID 类型）、创建受保护 DACL 的 `%ProgramData%\Cladus`。
+3. **首次安装**：创建全新的 Cladus 配置，不执行旧产品迁移或自动导入。
 4. `[Run]` 以 `runasoriginaluser` 启动 GUI（非特权）。
 
 **卸载**：
-1. `stemma-engine uninstall`：Disengage → 恢复 DNS 并确认 journal 清空 → 清理 ETW 会话 → 停止并删除服务。
-2. 清理所有用户配置档的 HKCU Run `Stemma` 值（已加载的 HKU 直接处理；未加载的临时挂载 NTUSER.DAT）。
-3. 删除 `%ProgramData%\Stemma\{logs,state}` 和当前用户的 `%LOCALAPPDATA%\Stemma`；**保留** `%ProgramData%\Stemma\config.json` 和 `%APPDATA%\Stemma\ui.json`。交互式卸载提供“同时删除所有设置”复选框，静默卸载默认保留。
+1. `cladus-engine uninstall`：Disengage → 恢复 DNS 并确认 journal 清空 → 清理 ETW 会话 → 停止并删除服务。
+2. 清理所有用户配置档的 HKCU Run `Cladus` 值（已加载的 HKU 直接处理；未加载的临时挂载 NTUSER.DAT）。
+3. 删除 `%ProgramData%\Cladus\{logs,state}` 和当前用户的 `%LOCALAPPDATA%\Cladus`；**保留** `%ProgramData%\Cladus\config.json` 和 `%APPDATA%\Cladus\ui.json`。交互式卸载提供“同时删除所有设置”复选框，静默卸载默认保留。
 4. `WinDivert64.sys` 若仍被占用，重启后删除。
 
-**CI 安装测试**：中文路径下安装 → 服务运行 → 升级（配置保留）→ 卸载 → 断言服务不存在、无 DNS journal、无 Run 值、无 ETW 会话、安装目录已清空、配置仍保留；另测 Clew 配置导入。
+**CI 安装测试**：中文路径下安装 → 服务运行 → 升级（配置保留）→ 卸载 → 断言服务不存在、无 DNS journal、无 Run 值、无 ETW 会话、安装目录已清空、配置仍保留；兼容格式仅支持显式 CLI 导入，不参与安装流程。
 
 ---
 
@@ -418,7 +418,7 @@ SOCKET 查询(TCP/UDP 线程) ─(最高优先)──┤──► 决策核心�
 
 - runner：`windows-2022`；Rust 版本固定；Node 24。
 - 流水线：fmt → clippy `-D warnings` → 单元测试（core 同时在 Linux 上跑）→ 分层检查 → cargo-deny → 前端 typecheck、构建、Playwright（mock IPC）→ release 构建（`+crt-static`）→ **管理员 e2e**（真实 WinDivert）→ Inno 打包 → 安装 / 升级 / 卸载测试 → 上传产物。
-- tag `vX.Y.Z`：全部通过后，由独立 job 发布 `stemma-X.Y.Z-windows-x64-setup.exe` 和 `SHA256SUMS`。
+- tag `vX.Y.Z`：全部通过后，由独立 job 发布 `cladus-X.Y.Z-windows-x64-setup.exe` 和 `SHA256SUMS`。
 - 版本号唯一来源为 git tag，由 build.rs 注入 exe 版本资源并同步 Tauri 配置。
 - 签名：暂不签名；后续可接入 SignPath 开源免费签名。
 
@@ -443,7 +443,7 @@ SOCKET 查询(TCP/UDP 线程) ─(最高优先)──┤──► 决策核心�
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **P0 骨架** | workspace、分层检查、CI（fmt / clippy / test / deny）、WinDivert 固定哈希引导脚本 | CI 绿；cargo-deny 生效 |
-| **P1 核心链路** | ETW 进程树 + ProcessKey；规则（名称 / cmdline / 路径）+ 树继承；WinDivert FFI；TCP SOCKET / NETWORK / PortTracker / SYN parking / 反射；acceptor（校验对端）；SOCKS5 TCP relay；不代理自身；全局 CIDR 排除；fail-open。以 `stemma-engine console --config <path>` 运行 | 管理员 e2e：40 个全新进程全部被截获，三级子进程继承成立，对照组直连；停车计数正常；强杀后网络正常 |
+| **P1 核心链路** | ETW 进程树 + ProcessKey；规则（名称 / cmdline / 路径）+ 树继承；WinDivert FFI；TCP SOCKET / NETWORK / PortTracker / SYN parking / 反射；acceptor（校验对端）；SOCKS5 TCP relay；不代理自身；全局 CIDR 排除；fail-open。以 `cladus-engine console --config <path>` 运行 | 管理员 e2e：40 个全新进程全部被截获，三级子进程继承成立，对照组直连；停车计数正常；强杀后网络正常 |
 | **P2 流量完整性** | UDP；IPv6 防泄漏 → IPv6 反射；完整目的过滤；手动 hijack / 排除；多代理组；连接表；统计 | UDP e2e；UDP-only 规则不影响 TCP（D1） |
 | **P3 DNS** | UDP + TCP forwarder、tx_id 重映射、v4 / v6 系统 DNS、journal、接口变化、失败回退 | 强杀 / 重启恢复 e2e |
 | **P4 服务化 + IPC** | 服务宿主与子命令、管道协议 v1、访问控制、配置存储、日志、Engage / Disengage、SCM 恢复 | 经服务跑通 P1 e2e；非管理员令牌被拒；强杀服务后自动重启并恢复 DNS |

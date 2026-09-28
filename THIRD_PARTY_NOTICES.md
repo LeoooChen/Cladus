@@ -2,7 +2,7 @@
 
 ## Clew
 
-Stemma's design and interception algorithms are derived from
+Cladus's design and interception algorithms are derived from
 [Clew](https://github.com/LeoooChen/clew-proxy), an MIT-licensed project.
 The reference checkout used for this rewrite is identified in `docs/DESIGN.md`.
 Its copyright and permission notice is reproduced below.
@@ -31,7 +31,7 @@ SOFTWARE.
 
 Upstream: https://github.com/basil00/WinDivert
 
-Stemma loads the unmodified WinDivert DLL at runtime. It does not compile a
+Cladus loads the unmodified WinDivert DLL at runtime. It does not compile a
 WinDivert Rust binding into the application. The bootstrap script retrieves
 the hash-pinned official binary archive, including its full `LICENSE` file.
 Distributions must include that license alongside the DLL and driver.

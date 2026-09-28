@@ -4,7 +4,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $Installer) {
-    $Installer = Get-ChildItem (Join-Path $root 'target/installer/stemma-*-setup.exe') |
+    $Installer = Get-ChildItem (Join-Path $root 'target/installer/cladus-*-setup.exe') |
         Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName
 }
 $out = Join-Path $root 'target/installer-test'
@@ -25,38 +25,47 @@ function Setup([string[]]$Arguments) {
     $p = Start-Process -FilePath $Installer -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
     if ($p.ExitCode -ne 0) { throw "setup $Arguments exited with $($p.ExitCode)" }
 }
-function Service { Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'" }
+function Service { Get-CimInstance Win32_Service -Filter "Name='CladusEngine'" }
 
-$dir = Join-Path $env:ProgramFiles 'Stemma 安装测试'
-$data = Join-Path $env:ProgramData 'Stemma'
+$dir = Join-Path $env:ProgramFiles 'Cladus 安装测试'
+$data = Join-Path $env:ProgramData 'Cladus'
 $code = 1
 $config = Join-Path $data 'config.json'
 $originalConfig = $null
 $originalBackup = $null
 $injectedJournal = $false
+$ownsTestData = $false
 try {
-    if (Service) { throw 'A Stemma service is already installed; not replacing it' }
+    if (Service) { throw 'A Cladus service is already installed; not replacing it' }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A931F2F9-36B8-4C52-9C9B-76AC7B86E1A3}_is1') { throw 'An existing Cladus installation must not be replaced by this test' }
     if (Test-Path -LiteralPath (Join-Path $data 'state\dns-journal.json')) { throw 'An existing DNS recovery journal needs attention; not replacing it' }
     if (Test-Path -LiteralPath $config) { $originalConfig = [IO.File]::ReadAllBytes($config) }
     if (Test-Path -LiteralPath ($config + '.bak')) { $originalBackup = [IO.File]::ReadAllBytes($config + '.bak') }
+    $ownsTestData = $true
     Setup -Arguments @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", "/LOG=`"$out\install.log`"", '/TASKS=')
     $service = Service
     if (-not $service -or $service.State -ne 'Running') { throw 'service is not running after install' }
-    if (-not $service.PathName.StartsWith("`"$dir\stemma-engine.exe`"")) { throw "service path is $($service.PathName)" }
-    foreach ($file in 'stemma.exe', 'stemma-engine.exe', 'WinDivert.dll', 'WinDivert64.sys', 'licenses\WinDivert.txt', 'licenses\DEPENDENCY_LICENSES.txt') {
+    if (-not $service.PathName.StartsWith("`"$dir\cladus-engine.exe`"")) { throw "service path is $($service.PathName)" }
+    foreach ($file in 'cladus.exe', 'cladus-engine.exe', 'WinDivert.dll', 'WinDivert64.sys', 'licenses\WinDivert.txt', 'licenses\DEPENDENCY_LICENSES.txt') {
         if (-not (Test-Path -LiteralPath (Join-Path $dir $file))) { throw "missing $file" }
     }
-    $status = & (Join-Path $dir 'stemma-engine.exe') status | ConvertFrom-Json
+    $status = & (Join-Path $dir 'cladus-engine.exe') status | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'status command failed' }
     if ($status.data.engaged) { throw 'service must start idle' }
     Say 'PASS install into a Chinese path; service running and idle'
 
     $config = Join-Path $data 'config.json'
     $json = Get-Content -Raw $config | ConvertFrom-Json
+    if ($null -eq $originalConfig) {
+        if ($json.rules.Count -ne 0 -or $json.proxy_groups[0].port -ne 7890 -or $json.dns.enabled) {
+            throw 'First installation did not create fresh default settings'
+        }
+        Say 'PASS first installation created fresh Cladus settings without importing another product'
+    }
     $json.proxy_groups[0].port = 17999
     $edited = Join-Path $out 'edited.json'
     [IO.File]::WriteAllText($edited, ($json | ConvertTo-Json -Depth 20))
-    & (Join-Path $dir 'stemma-engine.exe') set-config --config $edited | Out-Null
+    & (Join-Path $dir 'cladus-engine.exe') set-config --config $edited | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'set-config command failed' }
     Setup -Arguments @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", "/LOG=`"$out\upgrade.log`"", '/TASKS=')
     if ((Service).State -ne 'Running') { throw 'service is not running after upgrade' }
@@ -64,7 +73,7 @@ try {
     Say 'PASS upgrade kept the configuration and restarted the service'
 
     $uninstaller = Join-Path $dir 'unins000.exe'
-    & (Join-Path $dir 'stemma-engine.exe') stop
+    & (Join-Path $dir 'cladus-engine.exe') stop
     if ($LASTEXITCODE -ne 0) { throw 'cannot stop before recovery test' }
     $stateDir = Join-Path $data 'state'
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
@@ -73,7 +82,7 @@ try {
     $injectedJournal = $true
     $rejected = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$out\rejected-uninstall.log`"") -Wait -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 2
-    if (-not (Service) -or -not (Test-Path -LiteralPath $journal) -or -not (Test-Path -LiteralPath (Join-Path $dir 'stemma-engine.exe'))) {
+    if (-not (Service) -or -not (Test-Path -LiteralPath $journal) -or -not (Test-Path -LiteralPath (Join-Path $dir 'cladus-engine.exe'))) {
         throw 'failed DNS recovery did not preserve service and recovery files'
     }
     Say 'PASS corrupt recovery journal blocks uninstall and preserves service and files'
@@ -90,7 +99,7 @@ try {
     $left = Get-ChildItem -LiteralPath $dir -Recurse -ErrorAction SilentlyContinue | Where-Object Name -ne 'WinDivert64.sys'
     if ($left) { throw "left in the install directory: $($left.Name -join ', ')" }
     if (-not (Test-Path $config)) { throw 'uninstall removed the configuration' }
-    if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Stemma -ErrorAction SilentlyContinue) { throw 'logon entry left behind' }
+    if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Cladus -ErrorAction SilentlyContinue) { throw 'logon entry left behind' }
     Say 'PASS uninstall removed the service and program files and kept the configuration'
     $code = 0
 } catch {
@@ -101,9 +110,11 @@ try {
             Remove-Item -LiteralPath $journal
         }
     }
-    if (-not (Service)) {
+    if ($ownsTestData -and -not (Service)) {
         if ($null -ne $originalConfig) { [IO.File]::WriteAllBytes($config, $originalConfig) }
+        elseif (Test-Path -LiteralPath $config) { Remove-Item -LiteralPath $config }
         if ($null -ne $originalBackup) { [IO.File]::WriteAllBytes($config + '.bak', $originalBackup) }
+        elseif (Test-Path -LiteralPath ($config + '.bak')) { Remove-Item -LiteralPath ($config + '.bak') }
     }
 }
 exit $code

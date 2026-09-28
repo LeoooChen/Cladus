@@ -1,134 +1,76 @@
-# Development status
+# Cladus verification status
 
-Updated 2026-09-28. The 0.1.0 baseline is recorded below; see the final section
-for 0.1.1 repairs and current verification. Linux/macOS is explicitly deferred. The original design
-is in DESIGN.md; this file records the actual implementation and verification.
+Updated 2026-09-28 for Windows 0.1.3. Linux/macOS implementation remains deferred.
 
-## Delivered on Windows
+## Product identity
 
-- Rust TCP/UDP interception for IPv4 and IPv6, SOCKS5 relay, ordered rules,
-  descendant inheritance, destination filters and manual process assignments.
-- ETW process tracking, bounded SYN parking, PID reuse handling, single-engine
-  ownership, UDP association invalidation on policy changes and stop counters.
-- Windows service with idle startup, SCM crash restart, authenticated named-pipe
-  control, durable configuration/backup and rotating logs.
-- Optional system DNS forwarding over SOCKS5 TCP, UDP/TCP local listeners,
-  journaled restoration, interface monitoring, strict mode and direct fallback.
-  Reconfiguration discards stale upstream connections before queued requests;
-  shutdown cancels child tasks and releases client sockets.
-- Tauri/Vue desktop UI, rules/groups/process tree/connections, English/Chinese,
-  tray, logon startup, preferences and remembered window geometry. Exit asks the
-  service to disengage and reports recovery errors instead of silently exiting.
-- Clew v2 importer with validation and warnings; original Clew config is untouched.
-- Inno Setup installation/upgrade/uninstall, WebView2 bootstrap, protected install
-  directory, fail-safe DNS recovery during uninstall, 396 dependency notices,
-  local SHA256SUMS, CI packaging and tag-triggered release workflow.
-
-## Latest local verification
-
-| Check | Result / evidence |
+| Component | Name |
 | --- | --- |
-| Rust unit tests | **126 passed**, `target/final-unit-tests.log` |
-| Formatting, Clippy, layering | Passed; Clippy denies warnings |
-| cargo-deny | Advisories, bans, licenses and sources passed; duplicate-version/unmaintained dependency warnings remain advisory |
-| Frontend typecheck/build | Passed; Monaco/AG Grid bundle-size warning remains |
-| npm audit | Zero vulnerabilities |
-| Playwright mocked frontend | **20/20**, Chinese/English persistence, errors, editor, grid and four viewport/device-scale combinations |
-| Release WinDivert IPv4/IPv6 | **24/24**, `target/e2e-20260928-110504/acceptance.log` |
-| Service/IPC/crash persistence | Passed, `target/service-test-20260928-110652` |
-| Real DNS UDP/TCP/system resolver | Passed; 4 proxied answers and no fallback, `target/dns-test-20260928-110711/dns-test.log` |
-| DNS normal stop + forced service crash | Exact original settings restored in both cases; SCM restart verified |
-| Final installer | **4/4**, `target/installer-test/test.log`: Chinese path, upgrade preserving config, corrupt journal blocks uninstall, normal cleanup |
+| Desktop / executable | Cladus / `cladus.exe` |
+| Engine executable | `cladus-engine.exe` |
+| Windows service / IPC pipe | `CladusEngine` / `\\.\pipe\CladusEngine` |
+| ETW session / engine mutex | `CladusProcessEtw` / `Global\CladusEngine` |
+| Desktop application ID | `io.github.leooochen.cladus` |
+| Installer AppId | `{A931F2F9-36B8-4C52-9C9B-76AC7B86E1A3}` |
+| Data / UI / cache | `%ProgramData%\Cladus`, `%APPDATA%\Cladus`, `%LOCALAPPDATA%\Cladus` |
+| Logon startup value | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Cladus` |
+| Environment variables | `CLADUS_LOG`, `CLADUS_TEST_PROXY`, `CLADUS_TEST_URL` |
+| Source applications | `apps/cladus-engine`, `apps/cladus-gui` |
+| Source libraries | `cladus-core`, `cladus-ipc`, `cladus-platform-windows` |
 
-The routing suite retains all 20 immediate-orphan attempts, 20 sequential new
-processes and 20 concurrent new processes. All passed in the latest run, including
-63 expected TCP relays and zero active relays/parked SYNs after shutdown. Earlier
-intermittent orphan failures remain in historical logs; this pass does not make
-bounded, fail-open interception a guarantee against every scheduling delay.
+The repository is now at `D:\Document\Claude项目\Cladus`. The previous workspace
+location is an empty directory still held open by the current desktop chat.
+Open the new directory for subsequent project work.
 
-A test-server defect found during closing verification was fixed: it previously
-closed after a single partial HTTP read, which could reset the socket and truncate
-the reply. It now consumes the full request header before replying. Production
-routing assertions and stress counts were not weakened.
+## Installation scope
 
-Frontend testing initially hit one Vite connection reset with 8 workers; the full
-suite passed with 2, which CI now uses. A unit run overlapping installer testing
-also suffered local socket failures and one hang; after stopping that test runner,
-engine tests and the full workspace suite passed with the installer test finished.
-Run system-changing acceptance tests sequentially, separate from unit/UI tests.
+This is a fresh, independent installation. It does not migrate another product,
+look for its installation, or automatically import its configuration. Setup starts
+an idle service with the default SOCKS5 endpoint `127.0.0.1:7890`, no process rules,
+and DNS proxy disabled. Users configure their own endpoint and rules after setup.
+Explicit CLI `import-config` remains an optional manual operation.
 
-The host's existing Clew was not stopped or reconfigured. DNS tests use the
-service's explicit test-only coexistence option with no interception rules.
-Test services were removed and DNS restored; the final installer was not left
-installed as the user's daily proxy.
+## Verification
 
-## Local delivery
+- Rust workspace: 131 passed, one opt-in live-network test ignored by default;
+  log: `target/cladus-tests.log`.
+- Frontend typecheck/build and all 28 Playwright checks passed under the renamed
+  application paths, including four viewport/device-scale combinations.
+- Clippy with warnings denied, formatting and platform-boundary checks passed.
+- Dependency policy checks passed against the locally cached advisory database.
+  Refreshing the database failed with a network connection reset; no dependency
+  versions were changed by this rename.
+- Tracked file contents and paths have no previous product-name references.
+  Frontend production assets were checked independently as well.
 
-- `target/installer/stemma-0.1.0-windows-x64-setup.exe` (7,412,529 bytes)
-- `target/installer/SHA256SUMS`
-- SHA-256: `e85ce8deab60beeec034e4ebe2503208cc42b98cf8b503b6daee929209471b01`
-- Build: `scripts/package-windows.ps1`; usage and recovery: README.md.
+- Service acceptance passed: authenticated IPC, configuration persistence, SCM
+  crash recovery and removal; `target/service-test-20260928-134435`.
+- Installer acceptance: all five checks passed in `target/installer-test/test.log`:
+  Chinese-path installation, fresh default settings without automatic import,
+  upgrade preserving Cladus configuration, corrupt DNS journal blocking uninstall,
+  and clean uninstall preserving configuration. Test-owned settings were then
+  removed so a later real installation starts fresh.
+- Packaged executable reports `cladus-engine 0.1.3`; GUI file metadata identifies
+  the product as Cladus. The new installer checksum was verified.
 
-## Deferred and release limits
+## Delivery
 
-- Linux/macOS interception and desktop support: deferred at the user's request.
-  Existing portable boundaries/checks are retained; no new backend work was done.
-- Public GitHub release: not published. This checkout has no Git remote; the CI
-  workflow and tag-to-release job have not run on hosted runners.
-- Stemma executable/installer code signing is not configured.
-- Native tray restoration after Explorer restart and physical mixed-DPI monitor
-  changes still need manual acceptance. Playwright's mocked browser tests do not
-  substitute for those native checks.
-- Dedicated SOCKS5 credential controls, incremental GUI updates and further
-  telemetry remain future work. JSON credentials work in the engine.
-- Fragmented/IPsec traffic is not relayed. Traffic interception is fail-open.
-  DNS fallback is direct unless strict mode is selected.
+`target/installer/cladus-0.1.3-windows-x64-setup.exe` (7,625,745 bytes).
+SHA-256: `1e274879028d316e2474bbd381debf4e8be400096cb940d32295df7f1902ca45`.
+The matching `SHA256SUMS` is in the same directory. This is a fresh installation;
+configure the proxy endpoint and process rules after installing.
 
-## 0.1.1 repair verification (2026-09-28)
+## Usage and remaining limits
 
-- Reproduced the installed service stuck in TCP accept during Disengage. An
-  explicit connection to its redirect listener immediately released shutdown,
-  confirming that relying on a loopback wakeup could leave the service hanging.
-  The implementation now cancels an asynchronous accept with a oneshot signal.
-- The old website probe stopped after SOCKS5 CONNECT. The replacement waits for
-  real HTTP response headers, verifies TLS, uses proxy-side target DNS and has
-  a total timeout. The independent signal light checks only SOCKS5/authentication.
-- 131 default Rust tests passed; 28 Playwright tests passed, including delayed
-  stale health responses after saving new proxy settings. Clippy and dependency
-  audit passed. An additional opt-in live test reached Google through the user's
-  SOCKS5 endpoint and measured 222 ms including TLS.
-- Local DNS + SOCKS5 failed Google's TLS handshake, while proxy-side domain
-  resolution returned HTTP 200. The installed config had DNS proxy disabled;
-  users in this situation should enable DNS proxy and restart affected browsers
-  to clear cached DNS/connections. This is separate from SOCKS5 reachability.
-- Browser automation is unavailable for the user's Edge session. Native Edge
-  acceptance must not be inferred from the mocked frontend or HTTP client tests.
-- The old installed service was recovered and GUI exited normally. Installation
-  of the new build and post-upgrade native acceptance remain separate steps.
-
-See CHANGELOG.md for 0.1.1 changes. The 0.1.0 evidence above is historical.
-
-0.1.1 local package: `target/installer/stemma-0.1.1-windows-x64-setup.exe`,
-7,625,515 bytes. SHA-256:
-`14ab9c4a5f679ca30133e2973374bc42397e8fa50dbeda9ba25c0fe96dc59c54`.
-
-### Installed 0.1.1 follow-up
-
-The user installed 0.1.1. Edge and its descendants were assigned to the correct
-rule, but the preserved configuration still had DNS proxy disabled. The local
-router returned `2001::1` / `185.45.5.35` for Google, while Mihomo TUN supplied
-synthetic IPv4 addresses. After the user's explicit approval, DNS proxy was
-enabled and the original configuration backed up under `%ProgramData%/Stemma`.
-Direct forwarder queries returned Google's actual IPv4/IPv6 addresses.
-
-A temporary, narrowly matched curl test process using the correct Google IP
-still timed out with TUN on: 2 proxy decisions, 0 accepted connections, 0 relays.
-The redirect listener itself remained responsive. After the user disabled TUN,
-the same test using ordinary system DNS succeeded for both families: IPv4 HTTP
-200 (427 ms), IPv6 HTTP 302 (363 ms), with exactly 2 decisions, 2 accepted
-connections, 2 relays and 2 proxied DNS queries. No direct SOCKS proxy option was
-used for those requests: they actually traversed Stemma's WinDivert path.
-
-Temporary diagnostic rules were removed; the user's Edge rule and proxy endpoint
-were preserved. DNS proxy remains enabled. This verifies the installed data path
-without TUN; it does not establish compatibility with simultaneous Mihomo TUN.
+- Keep overlapping traffic interception/TUN disabled. Keep the upstream SOCKS5
+  listener running. Use DNS proxy where system DNS gives incorrect addresses;
+  restart affected browsers after changing DNS to clear old cached addresses.
+- Proxy connection lights check SOCKS5/authentication only. Website tests measure
+  real HTTP response headers, including TLS, with proxy-side target DNS.
+- The TCP accept loop is asynchronous and cancellable; exiting does not rely on
+  creating a loopback wakeup connection.
+- Fragmented/IPsec traffic is not relayed. Interception is fail-open; DNS falls
+  back to original resolvers unless strict mode is selected.
+- Code signing and public release publication are not configured. Native tray
+  recovery after Explorer restart and physical mixed-DPI monitor changes still
+  require manual acceptance; browser mocks do not establish those results.

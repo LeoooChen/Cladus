@@ -6,11 +6,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     $packages = ($metadata | ConvertFrom-Json).packages
     foreach ($package in $packages) {
-        if ($package.name -eq 'stemma-core') {
+        if ($package.name -eq 'cladus-core') {
             $forbidden = $package.dependencies | Where-Object {
-                $_.name -match '^(tokio|windows(-sys)?|stemma-platform-.+)$'
+                $_.name -match '^(tokio|windows(-sys)?|cladus-platform-.+)$'
             }
-        } elseif ($package.name -in @('stemma-engine', 'stemma-net', 'stemma-ipc')) {
+        } elseif ($package.name -in @('cladus-engine', 'cladus-net', 'cladus-ipc')) {
             $forbidden = $package.dependencies | Where-Object { $_.name -match '^windows(-sys)?$' }
         } else {
             continue

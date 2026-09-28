@@ -27,7 +27,7 @@ function Snapshot {
 }
 function Client([string[]]$Arguments) {
     $output = & $exe @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "stemma-engine $Arguments failed: $output" }
+    if ($LASTEXITCODE -ne 0) { throw "cladus-engine $Arguments failed: $output" }
     ($output -join "`n") | ConvertFrom-Json
 }
 function Wait-Until([scriptblock]$Condition, [string]$What) {
@@ -38,18 +38,18 @@ function Wait-Until([scriptblock]$Condition, [string]$What) {
     }
 }
 
-if (Get-Service -Name StemmaEngine -ErrorAction SilentlyContinue) { throw 'A Stemma service already exists; not replacing it' }
-$exe = Join-Path $OutDir 'stemma-engine.exe'
-Copy-Item (Join-Path $root 'target\debug\stemma-engine.exe') $exe
+if (Get-Service -Name CladusEngine -ErrorAction SilentlyContinue) { throw 'A Cladus service already exists; not replacing it' }
+$exe = Join-Path $OutDir 'cladus-engine.exe'
+Copy-Item (Join-Path $root 'target\debug\cladus-engine.exe') $exe
 $divert = Join-Path $root 'third_party\windivert'
-$data = Join-Path $env:ProgramData ('Stemma-dns-test-' + (Split-Path -Leaf $OutDir))
+$data = Join-Path $env:ProgramData ('Cladus-dns-test-' + (Split-Path -Leaf $OutDir))
 $journal = Join-Path $data 'state\dns-journal.json'
 $code = 1
 $before = Snapshot
 try {
     & $exe install --data-dir $data --windivert-dir $divert --allow-clew 2>&1 | Out-File -LiteralPath $log -Append -Encoding utf8
     & $exe start 2>&1 | Out-File -LiteralPath $log -Append -Encoding utf8
-    Wait-Until { (Get-Service StemmaEngine).Status -eq 'Running' } 'service start'
+    Wait-Until { (Get-Service CladusEngine).Status -eq 'Running' } 'service start'
     Start-Sleep -Milliseconds 500
     $config = (Client -Arguments @('get-config')).data
     $config.proxy_groups[0].port = $ProxyPort
@@ -76,10 +76,10 @@ try {
     if ((Snapshot) -ne $before) { throw 'DNS differs after disengage' }
     Say 'PASS disengage restored DNS exactly'
     Client -Arguments @('engage') | Out-Null
-    $old = (Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'").ProcessId
+    $old = (Get-CimInstance Win32_Service -Filter "Name='CladusEngine'").ProcessId
     Stop-Process -Id $old -Force
     Wait-Until {
-        $s = Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'"
+        $s = Get-CimInstance Win32_Service -Filter "Name='CladusEngine'"
         $s.State -eq 'Running' -and $s.ProcessId -ne $old -and -not (Test-Path $journal)
     } 'SCM restart and journal recovery'
     $after = Snapshot
@@ -89,7 +89,7 @@ try {
 } catch {
     Say "FAIL $_"
 } finally {
-    if (Get-Service -Name StemmaEngine -ErrorAction SilentlyContinue) { & $exe uninstall 2>&1 | Out-File -LiteralPath $log -Append -Encoding utf8 }
+    if (Get-Service -Name CladusEngine -ErrorAction SilentlyContinue) { & $exe uninstall 2>&1 | Out-File -LiteralPath $log -Append -Encoding utf8 }
     if (Test-Path $journal) { & $exe restore-dns --data-dir $data 2>&1 | Out-File -LiteralPath $log -Append -Encoding utf8 }
     if ((Snapshot) -ne $before) { Say 'WARNING system DNS differs from the start of the test' }
     Say "service logs: $data\logs"

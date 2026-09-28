@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — 2026-09-28
+
+- Name the product Cladus throughout the workspace, crates, executable names,
+  desktop identity, Windows service, IPC pipe, ETW session, mutexes, environment
+  variables, configuration directories, installer, shortcuts and documentation.
+- Use a new installer AppId and fresh Cladus settings. No old-product migration
+  or automatic configuration import is performed during installation.
+
 ## 0.1.2 — 2026-09-28
 
 - Remove old-project branding and repository links from the About section.

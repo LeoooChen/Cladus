@@ -6,12 +6,12 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const gui = join(root, 'apps/stemma-gui');
+const gui = join(root, 'apps/cladus-gui');
 const output = join(root, 'target/installer-dependencies/DEPENDENCY_LICENSES.txt');
 const metadata = JSON.parse(execFileSync('cargo', [
   'metadata', '--locked', '--format-version', '1', '--filter-platform', 'x86_64-pc-windows-msvc',
 ], { cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
-const sections = ['Stemma dependency licenses\nGenerated from Cargo.lock and package-lock.json.\nIncludes build tools; some listed code may not be present in the final binary.'];
+const sections = ['Cladus dependency licenses\nGenerated from Cargo.lock and package-lock.json.\nIncludes build tools; some listed code may not be present in the final binary.'];
 
 function texts(dir) {
   return readdirSync(dir, { withFileTypes: true })

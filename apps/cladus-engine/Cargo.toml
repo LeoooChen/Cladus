@@ -1,0 +1,32 @@
+[package]
+name = "cladus-engine"
+description = "The Cladus traffic engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "socks"] }
+serde.workspace = true
+serde_json.workspace = true
+cladus-core.workspace = true
+cladus-ipc.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cladus-platform-windows.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

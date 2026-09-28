@@ -46,8 +46,8 @@ if (-not $admin) {
 }
 
 $profile = if ($Release) { 'release' } else { 'debug' }
-$program = Join-Path $root "target\$profile\stemma-e2e.exe"
-$engine = Join-Path $root "target\$profile\stemma-engine.exe"
+$program = Join-Path $root "target\$profile\cladus-e2e.exe"
+$engine = Join-Path $root "target\$profile\cladus-engine.exe"
 $divert = Join-Path $root 'third_party\windivert'
 Push-Location $root
 try {

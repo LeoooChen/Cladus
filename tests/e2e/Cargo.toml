@@ -1,6 +1,6 @@
 [package]
-name = "stemma-e2e"
-description = "End-to-end acceptance test for the Stemma engine. Needs administrator rights."
+name = "cladus-e2e"
+description = "End-to-end acceptance test for the Cladus engine. Needs administrator rights."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,10 +12,10 @@ publish.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
-stemma-core.workspace = true
+cladus-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-stemma-platform-windows.workspace = true
+cladus-platform-windows.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [lints]
