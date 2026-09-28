@@ -9,6 +9,8 @@
   or automatic configuration import is performed during installation.
 - Allow up to 150 ms for a new TCP connection's process decision before the
   fail-open SYN watchdog releases it directly on slower Windows hosts.
+- Open a temporary program-and-port-scoped Windows Firewall rule for the
+  internal TCP redirect listener; remove it on stop or service recovery.
 
 ## 0.1.2 — 2026-09-28
 

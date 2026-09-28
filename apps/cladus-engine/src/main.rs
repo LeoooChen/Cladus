@@ -169,6 +169,7 @@ fn main() -> anyhow::Result<()> {
             cladus_platform_windows::service::stop()?;
             // Keep the service registration and journal if recovery fails.
             restore_dns(&data)?;
+            cladus_platform_windows::divert::remove_stale_firewall_rule()?;
             Ok(cladus_platform_windows::service::delete()?)
         }
         #[cfg(windows)]

@@ -48,22 +48,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/bootstrap-windows.ps1
-      - name: Permit reflected TCP test packets
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-NetFirewallRule -Name CladusE2ETcp -DisplayName 'Cladus E2E TCP reflection' `
-            -Direction Inbound -Action Allow -Protocol TCP -Profile Any `
-            -RemoteAddress 203.0.113.0/24 `
-            -Program (Join-Path $PWD 'target/release/cladus-engine.exe')
       - name: Real WinDivert acceptance tests
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test-windows.ps1 -Release
-      - name: Remove reflected TCP test rule
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: Remove-NetFirewallRule -Name CladusE2ETcp -ErrorAction SilentlyContinue
       - name: Service acceptance tests
         if: runner.os == 'Windows'
         shell: pwsh

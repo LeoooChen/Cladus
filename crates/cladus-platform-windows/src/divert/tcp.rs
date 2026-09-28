@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 
 use super::ffi::{self, Address, Handle, SocketData, WinDivert};
+use super::firewall::FirewallRule;
 use super::packet::{self, Packet};
 use super::parker::Parker;
 use super::tracker::{Decision, PortTracker, Publish, SlotState};
@@ -44,6 +45,7 @@ struct Shared {
 }
 
 pub(super) struct Tcp {
+    _firewall: FirewallRule,
     shared: Arc<Shared>,
     socket: Arc<Handle>,
     stop: oneshot::Sender<()>,
@@ -72,6 +74,7 @@ impl Tcp {
             .local_addr()
             .map_err(|e| PlatformError::Other(e.to_string()))?
             .port();
+        let firewall = FirewallRule::open(acceptor_port)?;
         // The accept loop has its own event-driven runtime. Shutdown must not
         // depend on a loopback connection succeeding (firewall/service isolation).
         let accept_runtime = tokio::runtime::Builder::new_current_thread()
@@ -154,6 +157,7 @@ impl Tcp {
             }
         });
         Ok(Self {
+            _firewall: firewall,
             shared,
             socket,
             stop,

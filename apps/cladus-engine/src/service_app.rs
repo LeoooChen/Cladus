@@ -94,6 +94,9 @@ fn run(
     builder
         .try_init()
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    if let Err(err) = cladus_platform_windows::divert::remove_stale_firewall_rule() {
+        tracing::warn!("could not clear stale TCP firewall rule: {err}");
+    }
     // The configured level applies at run time unless CLADUS_LOG overrides it.
     let set_level = move |config: &Config| {
         if !from_env {

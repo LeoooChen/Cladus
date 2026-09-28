@@ -22,6 +22,12 @@ starts it **idle**. Subsequent GUI launches do not need elevation for Windows
 administrators using their normal UAC token. Standard users who are not members
 of Administrators cannot control the engine.
 
+While proxying is active, the engine adds a Windows Defender Firewall inbound
+TCP rule scoped to its executable and temporary redirect listener port. It
+removes the rule on normal stop; a restarted service clears a rule left by a
+crash. If system policy prevents the rule from being added, TCP interception
+cannot start.
+
 1. Exit other traffic redirectors before starting Cladus to avoid overlapping
    interception. Also turn off the upstream
    client's TUN mode; keep its SOCKS5 listener running. Cladus supplies per-process
@@ -202,6 +208,8 @@ Windows 0.1.3 包含系统服务、桌面界面、DNS 转发、配置导入和�
 ### 安装与使用
 
 需要 Windows 10 2004（内部版本 19041）或更新版本，x64。以管理员身份运行 `cladus-0.1.3-windows-x64-setup.exe`。安装程序会在缺少 WebView2 时安装它（需要联网），注册 Cladus Engine 服务并使其以**空闲**状态启动。此后，Windows 管理员使用普通 UAC 令牌即可启动界面，无需再次提权；非管理员标准用户无法控制引擎。
+
+代理运行期间，引擎会添加一条 Windows Defender 防火墙入站 TCP 规则，仅适用于引擎程序和临时重定向监听端口。正常停止时会删除该规则；服务崩溃后重启时会清理遗留规则。如果系统策略禁止添加该规则，TCP 拦截将无法启动。
 
 1. 启用 Cladus 前退出其他流量重定向工具，并关闭上游代理客户端的 TUN 模式，但保留其 SOCKS5 监听端口。Cladus 自行处理按进程路由。测试中，Mihomo TUN 与 Cladus 同时运行会使被拦截的 TCP 连接卡住。
 2. 打开 Cladus，在代理组中设置 SOCKS5 地址和端口。默认值为 `127.0.0.1:7890`，请改成自己的代理地址。UDP 代理需要上游支持 UDP ASSOCIATE。

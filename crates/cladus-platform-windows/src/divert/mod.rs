@@ -12,6 +12,7 @@
 //! the engine; replies are injected back (see [`udp`]).
 
 mod ffi;
+mod firewall;
 mod packet;
 mod parker;
 mod tcp;
@@ -28,6 +29,11 @@ use cladus_core::platform::{
     Counter, DecisionOracle, Handoff, PlatformError, TrafficInterceptor, UdpInjector,
 };
 pub use ffi::WinDivert;
+
+/// Clears a rule left by a crash before the service starts idle.
+pub fn remove_stale_firewall_rule() -> Result<(), PlatformError> {
+    firewall::remove_stale()
+}
 
 /// Above the default of 0, so Cladus sees packets before other WinDivert
 /// users (such as Clew) and sends them on to those afterwards.
