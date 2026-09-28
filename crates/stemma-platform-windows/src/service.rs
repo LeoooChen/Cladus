@@ -1,7 +1,8 @@
 //! Windows Service Control Manager integration.
 
-use std::ffi::OsString;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -24,9 +25,17 @@ fn error(err: impl std::fmt::Debug) -> PlatformError {
 }
 
 fn open(access: ServiceAccess) -> Result<Service, PlatformError> {
+    open_optional(access)?.ok_or_else(|| error("Stemma Engine is not installed"))
+}
+
+fn open_optional(access: ServiceAccess) -> Result<Option<Service>, PlatformError> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(error)?;
-    manager.open_service(NAME, access).map_err(error)
+    match manager.open_service(NAME, access) {
+        Ok(service) => Ok(Some(service)),
+        Err(windows_service::Error::Winapi(err)) if err.raw_os_error() == Some(1060) => Ok(None),
+        Err(err) => Err(error(err)),
+    }
 }
 
 /// `extra` arguments are appended to the service command line.
@@ -113,7 +122,9 @@ pub fn start() -> Result<(), PlatformError> {
 }
 
 pub fn stop() -> Result<(), PlatformError> {
-    let service = open(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
+    let Some(service) = open_optional(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)? else {
+        return Ok(());
+    };
     if service.query_status().map_err(error)?.current_state == ServiceState::Stopped {
         return Ok(());
     }
@@ -121,9 +132,68 @@ pub fn stop() -> Result<(), PlatformError> {
     wait_for(&service, ServiceState::Stopped)
 }
 
-pub fn uninstall() -> Result<(), PlatformError> {
-    stop()?;
-    open(ServiceAccess::DELETE)?.delete().map_err(error)
+/// Delete only after the caller has restored DNS successfully.
+pub fn delete() -> Result<(), PlatformError> {
+    let Some(service) = open_optional(ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)? else {
+        return Ok(());
+    };
+    if service.query_status().map_err(error)?.current_state != ServiceState::Stopped {
+        return Err(error("stop Stemma Engine before deleting its registration"));
+    }
+    service.delete().map_err(error)
+}
+
+pub fn is_running() -> Result<bool, PlatformError> {
+    let Some(service) = open_optional(ServiceAccess::QUERY_STATUS)? else {
+        return Ok(false);
+    };
+    Ok(service.query_status().map_err(error)?.current_state != ServiceState::Stopped)
+}
+
+pub fn installed_data_dir() -> Result<Option<PathBuf>, PlatformError> {
+    let Some(service) = open_optional(ServiceAccess::QUERY_CONFIG)? else {
+        return Ok(None);
+    };
+    let config = service.query_config().map_err(error)?;
+    registered_data_dir(config.executable_path.as_os_str()).map(Some)
+}
+
+fn registered_data_dir(command: &OsStr) -> Result<PathBuf, PlatformError> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+    let mut count = 0;
+    // SAFETY: command is NUL-terminated and count is a valid output pointer.
+    let raw = unsafe { CommandLineToArgvW(crate::util::wide(command).as_ptr(), &mut count) };
+    if raw.is_null() {
+        return Err(crate::util::os_error(
+            "reading service arguments",
+            crate::util::last_error(),
+        ));
+    }
+    // SAFETY: the API returns count NUL-terminated argument strings in one allocation.
+    let arguments: Vec<OsString> = unsafe {
+        std::slice::from_raw_parts(raw, count as usize)
+            .iter()
+            .map(|&argument| {
+                let mut len = 0;
+                while *argument.add(len) != 0 {
+                    len += 1;
+                }
+                OsString::from_wide(std::slice::from_raw_parts(argument, len))
+            })
+            .collect()
+    };
+    // SAFETY: raw was allocated by CommandLineToArgvW and is no longer used.
+    unsafe { LocalFree(raw.cast()) };
+    let path = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--data-dir")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .ok_or_else(|| error("registered service has no data directory"))?;
+    if !path.is_absolute() {
+        return Err(error("registered service data directory must be absolute"));
+    }
+    Ok(path)
 }
 
 pub fn process_id() -> Result<u32, PlatformError> {
@@ -201,4 +271,25 @@ fn service_main(_: Vec<OsString>) {
         tracing::error!(%err, "service failed");
     }
     let _ = handle.set_service_status(status(ServiceState::Stopped, u32::from(result.is_err())));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_arguments_preserve_quoted_data_paths() {
+        let command = OsStr::new(
+            r#""C:\Program Files\Stemma\stemma-engine.exe" service --data-dir "C:\ProgramData\Stemma test" --windivert-dir "C:\Program Files\Stemma""#,
+        );
+        assert_eq!(
+            registered_data_dir(command).unwrap(),
+            PathBuf::from(r"C:\ProgramData\Stemma test")
+        );
+        assert!(registered_data_dir(OsStr::new("stemma-engine.exe service")).is_err());
+        assert!(
+            registered_data_dir(OsStr::new("stemma-engine.exe service --data-dir relative"))
+                .is_err()
+        );
+    }
 }

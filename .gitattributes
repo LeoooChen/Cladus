@@ -4,3 +4,6 @@
 *.isl text eol=crlf
 *.png binary
 *.ico binary
+# Preserve upstream formatting in vendored translations and license texts.
+installer/ChineseSimplified.isl whitespace=-blank-at-eol
+installer/licenses/*.txt whitespace=-blank-at-eol

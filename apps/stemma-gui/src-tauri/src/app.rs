@@ -13,6 +13,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_dialog::DialogExt;
 
 use crate::prefs::{self, Geometry, Prefs};
 use crate::{autostart, commands, engine, icons, view};
@@ -37,6 +38,7 @@ pub struct AppState {
     pub engine: Mutex<EngineState>,
     pub wake: tokio::sync::Notify,
     quitting: AtomicBool,
+    lifecycle: tokio::sync::Mutex<()>,
     icons: Mutex<HashMap<String, Option<Vec<u8>>>>,
     names: Mutex<HashMap<String, u32>>,
 }
@@ -58,10 +60,15 @@ fn tr(key: &'static str, language: &str) -> String {
 
 pub fn run() {
     let autostarted = std::env::args().any(|arg| arg == "--autostart");
+    let quit_only = std::env::args().any(|arg| arg == "--quit");
     let prefs = prefs::load();
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            show_main(app)
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if args.iter().any(|arg| arg == "--quit") {
+                quit(app);
+            } else {
+                show_main(app);
+            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
@@ -69,6 +76,7 @@ pub fn run() {
             engine: Mutex::new(EngineState::default()),
             wake: tokio::sync::Notify::new(),
             quitting: AtomicBool::new(false),
+            lifecycle: tokio::sync::Mutex::new(()),
             icons: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
         })
@@ -120,6 +128,10 @@ pub fn run() {
             commands::set_autostart,
         ])
         .setup(move |app| {
+            if quit_only {
+                app.handle().exit(0);
+                return Ok(());
+            }
             autostart::repair();
             create_window(app.handle(), autostarted)?;
             create_tray(app.handle())?;
@@ -274,13 +286,42 @@ pub fn quit(app: &AppHandle) {
         return;
     }
     save_geometry(app);
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
-    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(10), engine::ok(Request::Disengage)).await;
-        app.exit(0);
+        let state = app.state::<AppState>();
+        let _lifecycle = state.lifecycle.lock().await;
+        let result = tokio::time::timeout(Duration::from_secs(30), engine::ok(Request::Disengage))
+            .await
+            .map_err(|_| "The engine did not confirm shutdown in time.".to_owned())
+            .and_then(|result| result);
+        if result.is_ok() || matches!(stemma_platform_windows::service::is_running(), Ok(false)) {
+            app.exit(0);
+            return;
+        }
+        // A reply may have been lost after the stop completed.
+        if matches!(tokio::time::timeout(Duration::from_secs(2), engine::status()).await,
+            Ok(Ok(status)) if !status.engaged)
+        {
+            app.exit(0);
+            return;
+        }
+        state.quitting.store(false, Ordering::SeqCst);
+        let language = state.prefs.lock().unwrap().language.clone();
+        let message = format!(
+            "{}\n\n{}",
+            tr(
+                "Stemma could not confirm that proxying stopped. It will stay open so you can retry.",
+                &language
+            ),
+            result.unwrap_err()
+        );
+        state.engine.lock().unwrap().message = Some(message.clone());
+        show_main(&app);
+        app.dialog()
+            .message(message)
+            .title("Stemma")
+            .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+            .show(|_| {});
     });
 }
 
@@ -364,6 +405,10 @@ async fn poll(app: AppHandle) {
                     .unwrap_or(0)
                     != 0;
                 if !status.engaged {
+                    let _lifecycle = state.lifecycle.lock().await;
+                    if state.quitting.load(Ordering::SeqCst) {
+                        return;
+                    }
                     match engine::ok(Request::Engage).await {
                         Ok(()) => next.engaged = true,
                         Err(err) => next.message = Some(err),

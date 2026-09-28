@@ -38,8 +38,12 @@ Distributions must include that license alongside the DLL and driver.
 WinDivert is available under LGPL-3.0 or GPL-2.0; see the upstream license
 for the complete terms and corresponding source.
 
-## Rust Dependencies
+## Rust and JavaScript Dependencies
 
-Rust dependencies retain their respective licenses. `deny.toml` defines the
-allowed-license policy and CI checks it with `cargo-deny`. Complete release
-attributions will accompany packaged builds.
+Dependencies retain their respective licenses. `deny.toml` defines the Rust
+allowed-license policy and CI checks it with `cargo-deny`. Packaged builds
+include `licenses/DEPENDENCY_LICENSES.txt`, generated from the locked Rust
+and npm packages by `scripts/package-licenses.mjs`. It contains the license
+texts and links to the exact package versions and their corresponding source.
+MPL-covered dependencies are used unmodified; their source remains available
+through those links. WinDivert's license is in `licenses/WinDivert.txt`.

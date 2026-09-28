@@ -34,8 +34,23 @@ enum Command {
     /// Restores system DNS settings left redirected by a crash (administrator).
     RestoreDns(DataArgs),
     #[cfg(windows)]
+    /// Imports a Clew `clew.json` as the service configuration (administrator).
+    ImportClew {
+        /// The Clew configuration file; it is only read.
+        #[arg(long)]
+        from: PathBuf,
+        #[command(flatten)]
+        data: DataArgs,
+    },
+    #[cfg(windows)]
     /// Registers the Windows service (administrator).
     Install(service_app::ServiceArgs),
+    #[cfg(windows)]
+    #[command(hide = true)]
+    SecureInstallDir {
+        #[arg(long)]
+        path: PathBuf,
+    },
     #[cfg(windows)]
     /// Stops and unregisters the service (administrator).
     Uninstall,
@@ -128,18 +143,36 @@ fn main() -> anyhow::Result<()> {
         #[cfg(windows)]
         Command::Install(args) => service_app::install(args),
         #[cfg(windows)]
+        Command::SecureInstallDir { path } => {
+            stemma_platform_windows::security::secure_install_directory(&std::path::absolute(
+                path,
+            )?)?;
+            Ok(())
+        }
+        #[cfg(windows)]
         Command::RestoreDns(args) => restore_dns(&args.dir()?),
         #[cfg(windows)]
+        Command::ImportClew { from, data } => import_clew(&from, &data.dir()?),
+        #[cfg(windows)]
         Command::Uninstall => {
-            stemma_platform_windows::service::uninstall()?;
-            // The service restores DNS when it stops; this covers a service
-            // that could not.
-            restore_dns(&default_data_dir()?)
+            let data = stemma_platform_windows::service::installed_data_dir()?
+                .map(Ok)
+                .unwrap_or_else(default_data_dir)?;
+            stemma_platform_windows::service::stop()?;
+            // Keep the service registration and journal if recovery fails.
+            restore_dns(&data)?;
+            Ok(stemma_platform_windows::service::delete()?)
         }
         #[cfg(windows)]
         Command::Start => Ok(stemma_platform_windows::service::start()?),
         #[cfg(windows)]
-        Command::Stop => Ok(stemma_platform_windows::service::stop()?),
+        Command::Stop => {
+            let data = stemma_platform_windows::service::installed_data_dir()?
+                .map(Ok)
+                .unwrap_or_else(default_data_dir)?;
+            stemma_platform_windows::service::stop()?;
+            restore_dns(&data)
+        }
         #[cfg(windows)]
         Command::Status => service_app::client(stemma_ipc::Request::Status),
         #[cfg(windows)]
@@ -181,12 +214,13 @@ fn console(args: ConsoleArgs) -> anyhow::Result<()> {
     let data = args.data.dir()?;
     #[cfg(windows)]
     restore_dns(&data)?;
-    let engine = start(&config, args.windivert_dir.as_deref(), &data)?;
+    let mut engine = start(&config, args.windivert_dir.as_deref(), &data)?;
     if let Some(path) = &args.ready_file {
         std::fs::write(path, "ready")?;
     }
     info!("running; press Ctrl+C to stop");
     wait_for_stop(args.stop_file.as_deref(), &engine)?;
+    engine.prepare_stop()?;
     let counters = engine.stop();
     log_counters(&counters);
     if let Some(path) = &args.stats_file {
@@ -196,6 +230,38 @@ fn console(args: ConsoleArgs) -> anyhow::Result<()> {
             .collect();
         std::fs::write(path, serde_json::Value::Object(map).to_string())?;
     }
+    Ok(())
+}
+
+/// Replaces the configuration (the old one is kept as `config.json.bak`).
+/// A running service picks it up at once.
+#[cfg(windows)]
+fn import_clew(from: &Path, data: &Path) -> anyhow::Result<()> {
+    let text =
+        std::fs::read_to_string(from).with_context(|| format!("cannot read {}", from.display()))?;
+    let imported = stemma_core::clew::import_clew(&text).map_err(anyhow::Error::msg)?;
+    for warning in &imported.warnings {
+        eprintln!("warning: {warning}");
+    }
+    stemma_platform_windows::security::secure_directory(data)?;
+    if stemma_platform_windows::service::is_running()? {
+        let installed = stemma_platform_windows::service::installed_data_dir()?
+            .context("running service has no data directory")?;
+        if std::fs::canonicalize(installed)? != std::fs::canonicalize(data)? {
+            bail!("the running service uses another data directory; stop it before importing");
+        }
+        service_app::client(stemma_ipc::Request::SetConfig {
+            config: Box::new(imported.config.clone()),
+        })?;
+    } else {
+        let _instance = stemma_platform_windows::EngineInstance::acquire()?;
+        stemma_engine::host::save_config(&data.join("config.json"), &imported.config)?;
+    }
+    println!(
+        "Imported {} rule(s) and {} proxy group(s) from Clew.",
+        imported.config.rules.len(),
+        imported.config.proxy_groups.len()
+    );
     Ok(())
 }
 

@@ -6,6 +6,7 @@
 //! which owns the process tree and answers "should this connection be
 //! proxied, and through which group?".
 
+pub mod clew;
 pub mod config;
 pub mod decision;
 pub mod matching;

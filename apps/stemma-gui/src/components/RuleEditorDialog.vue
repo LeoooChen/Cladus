@@ -312,7 +312,6 @@ function onClose(value: boolean) {
               </div>
               <div class="flex flex-col select-none">
                 <span class="text-sm font-medium text-slate-700 dark:text-slate-200"> {{ t('Capture Entire Process Tree') }} </span>
-                <span class="text-xs text-slate-500 dark:text-slate-400"> {{ t('Always enabled in v0.9.0+. Per-rule single-process mode is not currently exposed.') }} </span>
               </div>
             </div>
 

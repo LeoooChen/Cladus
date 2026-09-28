@@ -1,23 +1,44 @@
 import { test, expect, type Page } from '@playwright/test'
 
-async function mockBackend(page: Page, language = 'system', failSave = false) {
-  let config = { ui: { language, close_to_tray: false }, log_level: 'info', dns: { enabled: false } }
-  await page.route('http://127.0.0.1:5173/api/**', async route => {
-    const path = new URL(route.request().url()).pathname
-    if (path === '/api/config') {
-      if (route.request().method() === 'PUT') {
-        if (failSave) return route.fulfill({ status: 500, body: 'save failed' })
-        config = route.request().postDataJSON()
-        return route.fulfill({ json: { success: true } })
-      }
-      return route.fulfill({ json: config })
+// The desktop host is replaced by a mock of Tauri's IPC. Its state lives in
+// the test process, so it survives page reloads.
+async function mockBackend(page: Page, language = 'system', failSave = false, connections: unknown[] = []) {
+  const prefs = { language, close_to_tray: false, start_minimized: false }
+  const config = { version: 1, proxy_groups: [], rules: [], log_level: 'info', dns: { enabled: false, upstream: '8.8.8.8:53', strict: false } }
+  await page.exposeFunction('__mockInvoke', (cmd: string, args: Record<string, unknown>) => {
+    switch (cmd) {
+      case 'get_ui_prefs': return prefs
+      case 'set_ui_prefs':
+        if (failSave) throw new Error('save failed')
+        if (args.language) prefs.language = args.language as string
+        return null
+      case 'engine_state': return { connected: true, engaged: true, message: null, dns_fallback: false }
+      case 'get_stats': return { hijacked_pids: 0, auto_rules_count: 0 }
+      case 'get_autostart': return { enabled: false, start_minimized: false }
+      case 'get_config': return config
+      case 'list_groups': return [{ id: 0, name: 'default', host: '127.0.0.1', port: 7890, type: 'socks5', test_url: 'https://example.com' }]
+      case 'connections': return connections
+      case 'list_rules': return []
+      default: return null
     }
-    if (path === '/api/stats') return route.fulfill({ json: { hijacked_pids: 0, auto_rules_count: 0 } })
-    if (path === '/api/autostart') return route.fulfill({ json: { enabled: false, start_minimized: false } })
-    if (path === '/api/proxy-groups') return route.fulfill({ json: [{ id: 0, name: 'default', host: '127.0.0.1', port: 7890, type: 'socks5', test_url: 'https://example.com' }] })
-    return route.fulfill({ json: [] })
   })
-  return () => config
+  await page.addInitScript(() => {
+    let next = 1
+    const w = window as unknown as Record<string, unknown>
+    w.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'main' }, currentWebview: { windowLabel: 'main', label: 'main' } },
+      transformCallback: () => next++,
+      unregisterCallback: () => {},
+      convertFileSrc: (path: string, protocol: string) => `http://${protocol}.localhost/${encodeURIComponent(path)}`,
+      invoke: async (cmd: string, args: Record<string, unknown>) => {
+        if (cmd.startsWith('plugin:')) return cmd.endsWith('|listen') ? next++ : null
+        const call = (w.__mockInvoke as (c: string, a: unknown) => Promise<unknown>)
+        try { return await call(cmd, args ?? {}) } catch (e) { throw String((e as Error).message ?? e) }
+      },
+    }
+    w.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} }
+  })
+  return () => prefs
 }
 
 async function settings(page: Page, label = '设置') {
@@ -44,7 +65,7 @@ test('system Chinese, translated dialogs and settings at native scale', async ({
 })
 
 test('language is persisted and survives reload in both directions', async ({ page }) => {
-  const config = await mockBackend(page)
+  const prefs = await mockBackend(page)
   await page.goto('/')
   await settings(page)
   // Labels update before location.reload() commits. Wait for the app's reload
@@ -54,7 +75,7 @@ test('language is persisted and survives reload in both directions', async ({ pa
     page.getByLabel('语言', { exact: true }).selectOption('en'),
   ])
   await expect(page.getByLabel('Language', { exact: true })).toHaveValue('en')
-  expect(config().ui.language).toBe('en')
+  expect(prefs().language).toBe('en')
   await page.reload()
   await expect(page.locator('html')).toHaveAttribute('lang', 'en')
   await settings(page, 'Settings')
@@ -63,7 +84,7 @@ test('language is persisted and survives reload in both directions', async ({ pa
     page.getByLabel('Language', { exact: true }).selectOption('zh-CN'),
   ])
   await expect(page.getByLabel('语言', { exact: true })).toHaveValue('zh-CN')
-  expect(config().ui.language).toBe('zh-CN')
+  expect(prefs().language).toBe('zh-CN')
   await page.reload()
   await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN')
 })
@@ -94,14 +115,12 @@ test('unsupported preference falls back to system; unsaved editor is protected',
   await expect(page.getByText('有未保存的更改', { exact: true })).toBeVisible()
 })
 
-
-
 test('network grid headers, states, filtering and empty text are localized', async ({ page }) => {
-  await mockBackend(page, 'zh-CN')
-  await page.route('**/api/tcp', route => route.fulfill({ json: [{
+  await mockBackend(page, 'zh-CN', false, [{
     pid: 100, process_name: '程序.exe', protocol: 'TCP', local_ip: '127.0.0.1', local_port: 45678,
-    remote_ip: '1.1.1.1', remote_port: 443, state: 'ESTABLISHED', proxy_status: 'PROXIED', pid_alive: true,
-  }] }))
+    remote_ip: '1.1.1.1', remote_port: 443, dest: '1.1.1.1:443', state: 'ESTABLISHED', proxy_status: 'PROXIED',
+    hijacked: true, pid_alive: true,
+  }])
   await page.goto('/')
   await expect(page.getByRole('columnheader', { name: '连接状态' })).toBeVisible()
   await expect(page.getByText('已建立', { exact: true })).toBeVisible()

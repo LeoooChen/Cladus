@@ -30,12 +30,14 @@ pub struct DnsRedirect {
 }
 
 impl DnsRedirect {
-    pub fn new(system: Arc<dyn SystemDns>, journal: PathBuf) -> Self {
-        Self {
+    pub fn new(system: Arc<dyn SystemDns>, journal: PathBuf) -> anyhow::Result<Self> {
+        // Never replace a previous run's original settings with redirected ones.
+        recover(system.as_ref(), &journal)?;
+        Ok(Self {
             system,
             journal,
             applied: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     /// Redirects interfaces not redirected yet, including ones that appeared
@@ -51,6 +53,7 @@ impl DnsRedirect {
             .map(sanitize)
             .collect();
         if !fresh.is_empty() {
+            let mut failures = Vec::new();
             let mut all = applied.clone();
             all.extend(fresh.iter().cloned());
             write_journal(&self.journal, &all)?;
@@ -59,9 +62,12 @@ impl DnsRedirect {
                 let result = self.system.redirect(&interface.id, LISTEN_V4, LISTEN_V6);
                 match result {
                     Ok(()) => info!(interface = %interface.name, "DNS redirected to the forwarder"),
-                    Err(err) => warn!(interface = %interface.name, "cannot redirect DNS: {err}"),
+                    Err(err) => failures.push(format!("{}: {err}", interface.name)),
                 }
                 applied.push(interface);
+            }
+            if !failures.is_empty() {
+                anyhow::bail!("cannot redirect DNS: {}", failures.join("; "));
             }
         }
         Ok(original_servers(&applied))
@@ -70,6 +76,9 @@ impl DnsRedirect {
     /// Restores every interface; the journal is kept if any restore failed.
     pub fn restore(&self) -> anyhow::Result<()> {
         let mut applied = self.applied.lock().unwrap();
+        if applied.is_empty() {
+            return Ok(());
+        }
         let failed = restore_all(self.system.as_ref(), &applied);
         if failed.is_empty() {
             remove_journal(&self.journal)?;
@@ -252,7 +261,7 @@ mod tests {
         ];
         *fake.state.lock().unwrap() = original.clone();
         let journal = temp_journal("cycle");
-        let redirect = DnsRedirect::new(fake.clone(), journal.clone());
+        let redirect = DnsRedirect::new(fake.clone(), journal.clone()).unwrap();
         let servers = redirect.apply().unwrap();
         assert_eq!(
             servers,
@@ -288,7 +297,7 @@ mod tests {
         let original = vec![interface("a", false, "1.1.1.1")];
         *fake.state.lock().unwrap() = original.clone();
         let journal = temp_journal("crash");
-        let redirect = DnsRedirect::new(fake.clone(), journal.clone());
+        let redirect = DnsRedirect::new(fake.clone(), journal.clone()).unwrap();
         redirect.apply().unwrap();
         std::mem::forget(redirect); // crash: no restore
         assert!(recover(fake.as_ref(), &journal).unwrap());
@@ -301,7 +310,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         *fake.state.lock().unwrap() = vec![interface("a", true, "1.1.1.1")];
         let journal = temp_journal("fail");
-        let redirect = DnsRedirect::new(fake.clone(), journal.clone());
+        let redirect = DnsRedirect::new(fake.clone(), journal.clone()).unwrap();
         redirect.apply().unwrap();
         *fake.fail_restore.lock().unwrap() = true;
         assert!(redirect.restore().is_err());
@@ -315,5 +324,21 @@ mod tests {
     fn stale_forwarder_settings_restore_as_automatic() {
         let clean = sanitize(interface("a", false, "127.0.0.2"));
         assert!(clean.v4.automatic && clean.v4.servers.is_empty());
+    }
+
+    #[test]
+    fn failed_recovery_cannot_overwrite_the_original_journal() {
+        let fake = Arc::new(Fake::default());
+        let original = vec![interface("a", false, "9.9.9.9")];
+        let journal = temp_journal("preserve");
+        write_journal(&journal, &original).unwrap();
+        let before = std::fs::read(&journal).unwrap();
+        *fake.fail_restore.lock().unwrap() = true;
+        assert!(DnsRedirect::new(fake.clone(), journal.clone()).is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        *fake.fail_restore.lock().unwrap() = false;
+        let redirect = DnsRedirect::new(fake, journal.clone()).unwrap();
+        assert!(!journal.exists());
+        drop(redirect);
     }
 }

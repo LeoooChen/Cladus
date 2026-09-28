@@ -67,7 +67,50 @@ fn sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u64>> {
 }
 
 pub fn secure_directory(path: &Path) -> io::Result<()> {
-    let descriptor = descriptor("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
+    secure_directory_with_acl(path, "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+}
+
+/// A service executable must never be replaceable by a standard user, even
+/// when the installer is pointed outside Program Files.
+pub fn secure_install_directory(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() || path.parent().is_none() {
+        return Err(io::Error::other(
+            "choose a dedicated installation directory",
+        ));
+    }
+    if path.exists() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !matches!(
+                name.as_str(),
+                "stemma.exe"
+                    | "stemma-engine.exe"
+                    | "windivert.dll"
+                    | "windivert64.sys"
+                    | "licenses"
+                    | "license"
+                    | "third_party_notices.md"
+                    | "unins000.exe"
+                    | "unins000.dat"
+            ) || std::fs::symlink_metadata(entry.path())?.file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+            {
+                return Err(io::Error::other(
+                    "installation directory contains unrelated files or reparse points",
+                ));
+            }
+        }
+    }
+    secure_directory_with_acl(
+        path,
+        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)",
+    )
+}
+
+fn secure_directory_with_acl(path: &Path, sddl: &str) -> io::Result<()> {
+    let descriptor = descriptor(sddl)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,

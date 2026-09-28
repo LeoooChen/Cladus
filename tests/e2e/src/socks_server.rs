@@ -84,16 +84,24 @@ fn serve(
     }
     stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])?;
 
-    // Read the client's request, then answer and close.
-    let mut buffer = [0u8; 1024];
-    let _ = stream.read(&mut buffer)?;
+    // TCP reads need not contain a full request. Closing with unread request
+    // bytes can reset the socket on Windows and truncate our test response.
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte)?;
+        request.push(byte[0]);
+        if request.len() > 8192 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+    }
     let body = format!("{marker} {target}");
     seen.lock().unwrap().push(target);
-    write!(
-        stream,
+    let response = format!(
         "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    )?;
+    );
+    stream.write_all(response.as_bytes())?;
     Ok(())
 }
 

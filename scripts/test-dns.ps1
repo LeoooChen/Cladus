@@ -51,13 +51,13 @@ try {
     & $exe start 2>&1 | Out-File -LiteralPath $log -Append -Encoding utf8
     Wait-Until { (Get-Service StemmaEngine).Status -eq 'Running' } 'service start'
     Start-Sleep -Milliseconds 500
-    $config = (Client @('get-config')).data
+    $config = (Client -Arguments @('get-config')).data
     $config.proxy_groups[0].port = $ProxyPort
     $config.dns.enabled = $true
     $file = Join-Path $OutDir 'config.json'
     [IO.File]::WriteAllText($file, ($config | ConvertTo-Json -Depth 20))
-    Client @('set-config', '--config', $file) | Out-Null
-    Client @('engage') | Out-Null
+    Client -Arguments @('set-config', '--config', $file) | Out-Null
+    Client -Arguments @('engage') | Out-Null
     if (-not (Test-Path $journal)) { throw 'no DNS journal while redirected' }
     $redirected = Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses -contains '127.0.0.2' }
     if (-not $redirected) { throw 'no interface points at 127.0.0.2' }
@@ -68,14 +68,14 @@ try {
     Clear-DnsClientCache
     $system = Resolve-DnsName -Name www.wikipedia.org -DnsOnly
     Say "PASS system resolver answered $($system.Count) records"
-    $counters = (Client @('status')).data.counters
+    $counters = (Client -Arguments @('status')).data.counters
     if ($counters.'dns.proxied' -lt 3) { throw "expected proxied DNS answers, counters: $($counters | ConvertTo-Json)" }
     Say "PASS dns.proxied=$($counters.'dns.proxied') dns.fallback=$($counters.'dns.fallback')"
-    Client @('disengage') | Out-Null
+    Client -Arguments @('disengage') | Out-Null
     if (Test-Path $journal) { throw 'journal remains after disengage' }
     if ((Snapshot) -ne $before) { throw 'DNS differs after disengage' }
     Say 'PASS disengage restored DNS exactly'
-    Client @('engage') | Out-Null
+    Client -Arguments @('engage') | Out-Null
     $old = (Get-CimInstance Win32_Service -Filter "Name='StemmaEngine'").ProcessId
     Stop-Process -Id $old -Force
     Wait-Until {

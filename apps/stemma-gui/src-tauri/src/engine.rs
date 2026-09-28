@@ -26,7 +26,10 @@ fn unreachable_message(err: &std::io::Error) -> String {
 }
 
 pub async fn ok(request: Request) -> Result<(), String> {
-    call(request).await.map(drop)
+    match call(request).await? {
+        Response::Ok => Ok(()),
+        other => Err(unexpected(&other)),
+    }
 }
 
 pub async fn config() -> Result<Config, String> {

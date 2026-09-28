@@ -83,11 +83,11 @@ impl SystemDns for WinSystemDns {
                 }
             }
             // Only change an interface whose mode can be restored exactly.
-            let (Some(auto4), Some(auto6)) = (
-                is_automatic(&format!(
+            let (Some(configured4), Some(configured6)) = (
+                configured_servers(&format!(
                     r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{id}"
                 )),
-                is_automatic(&format!(
+                configured_servers(&format!(
                     r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{id}"
                 )),
             ) else {
@@ -98,12 +98,20 @@ impl SystemDns for WinSystemDns {
                 id,
                 name,
                 v4: DnsServers {
-                    automatic: auto4,
-                    servers: v4,
+                    automatic: configured4.is_empty(),
+                    servers: if configured4.is_empty() {
+                        v4
+                    } else {
+                        configured4
+                    },
                 },
                 v6: DnsServers {
-                    automatic: auto6,
-                    servers: v6,
+                    automatic: configured6.is_empty(),
+                    servers: if configured6.is_empty() {
+                        v6
+                    } else {
+                        configured6
+                    },
                 },
             });
         }
@@ -128,8 +136,33 @@ impl SystemDns for WinSystemDns {
                     .join(",")
             }
         };
-        set(&original.id, false, &list(&original.v4))?;
-        set(&original.id, true, &list(&original.v6))
+        // Attempt both families even when one fails, then verify the settings
+        // themselves rather than assuming a successful setter persisted them.
+        let v4 = set(&original.id, false, &list(&original.v4));
+        let v6 = set(&original.id, true, &list(&original.v6));
+        v4?;
+        v6?;
+        for (protocol, expected) in [("Tcpip", &original.v4), ("Tcpip6", &original.v6)] {
+            let key = format!(
+                r"SYSTEM\CurrentControlSet\Services\{protocol}\Parameters\Interfaces\{}",
+                original.id
+            );
+            let actual = configured_servers(&key).ok_or_else(|| {
+                PlatformError::Other(format!("cannot verify restored DNS on {}", original.name))
+            })?;
+            let expected = if expected.automatic {
+                &[][..]
+            } else {
+                &expected.servers[..]
+            };
+            if actual != expected {
+                return Err(PlatformError::Other(format!(
+                    "DNS restore verification failed on {} ({protocol})",
+                    original.name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -161,7 +194,7 @@ fn set(id: &str, ipv6: bool, servers: &str) -> Result<(), PlatformError> {
 
 /// The NameServer registry value holds only explicitly configured servers;
 /// a missing or blank value means automatic.
-fn is_automatic(subkey: &str) -> Option<bool> {
+fn configured_servers(subkey: &str) -> Option<Vec<IpAddr>> {
     let key = wide(subkey);
     let value = wide("NameServer");
     let mut bytes = 0u32;
@@ -178,7 +211,7 @@ fn is_automatic(subkey: &str) -> Option<bool> {
         )
     };
     if rc == ERROR_FILE_NOT_FOUND {
-        return Some(true);
+        return Some(Vec::new());
     }
     if rc != NO_ERROR {
         return None;
@@ -201,10 +234,14 @@ fn is_automatic(subkey: &str) -> Option<bool> {
     }
     let text =
         String::from_utf16_lossy(&text[..text.iter().position(|&c| c == 0).unwrap_or(text.len())]);
-    Some(
-        text.trim_matches(|c: char| c.is_whitespace() || c == ',' || c == ';')
-            .is_empty(),
-    )
+    parse_servers(&text)
+}
+
+fn parse_servers(text: &str) -> Option<Vec<IpAddr>> {
+    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse().ok())
+        .collect()
 }
 
 /// # Safety
@@ -258,6 +295,21 @@ fn parse_guid(s: &str) -> Option<GUID> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_servers_preserve_order_and_reject_lossy_values() {
+        assert_eq!(parse_servers(" , ; "), Some(vec![]));
+        assert_eq!(
+            parse_servers("9.9.9.9, 1.1.1.1;2001:4860:4860::8888").unwrap(),
+            [
+                "9.9.9.9".parse::<IpAddr>().unwrap(),
+                "1.1.1.1".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap()
+            ]
+        );
+        assert!(parse_servers("9.9.9.9 invalid").is_none());
+        assert!(parse_servers("fe80::1%12").is_none());
+    }
 
     #[test]
     fn guids_parse() {

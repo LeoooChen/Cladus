@@ -46,14 +46,20 @@ struct DnsState {
     watcher: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
-impl Drop for DnsState {
-    fn drop(&mut self) {
+impl DnsState {
+    fn restore(&mut self) -> anyhow::Result<()> {
         if let Some((stop, thread)) = self.watcher.take() {
             drop(stop);
             let _ = thread.join();
         }
         // Point the system back at its own servers before the forwarder goes.
-        if let Err(err) = self.redirect.restore() {
+        self.redirect.restore()
+    }
+}
+
+impl Drop for DnsState {
+    fn drop(&mut self) {
+        if let Err(err) = self.restore() {
             warn!("{err:#}");
         }
     }
@@ -280,26 +286,28 @@ impl Engine {
 
     /// Call only with a validated configuration.
     pub fn reconfigure(&mut self, config: &Config) -> anyhow::Result<()> {
+        config.validate()?;
+        self.apply_dns(config)?;
         let mut core = self.core.lock_urgent();
         core.reconfigure(config, self.core.inspector.as_ref());
         *self.core.policies.write().unwrap() = core.policies();
         *self.groups.write().unwrap() = groups_of(config);
         drop(core);
         self.interceptor.refresh_assignments();
-        self.apply_dns(config)
+        Ok(())
     }
 
     fn apply_dns(&mut self, config: &Config) -> anyhow::Result<()> {
         if !config.dns.enabled {
+            if let Some(state) = &mut self.dns {
+                state.restore()?;
+            }
             self.dns = None;
             return Ok(());
         }
-        let proxy = self
-            .groups
-            .read()
-            .unwrap()
-            .get(&config.dns.proxy_group_id)
-            .cloned();
+        let proxy = config
+            .group(config.dns.proxy_group_id)
+            .map(|group| Arc::new(ProxyEndpoint::from(group)));
         let mut settings = DnsSettings {
             upstream: config.dns.upstream,
             proxy,
@@ -331,7 +339,7 @@ impl Engine {
         let redirect = Arc::new(DnsRedirect::new(
             Arc::clone(&backend.system),
             backend.journal.clone(),
-        ));
+        )?);
         let mut state = DnsState {
             forwarder,
             redirect,
@@ -386,6 +394,16 @@ impl Engine {
         );
         self.interceptor.refresh_assignments();
         changed
+    }
+
+    /// Stops the engine and returns its final counters.
+    /// Restore DNS first when an interactive stop must report recovery failures.
+    pub fn prepare_stop(&mut self) -> anyhow::Result<()> {
+        if let Some(state) = &mut self.dns {
+            state.restore()?;
+        }
+        self.dns = None;
+        Ok(())
     }
 
     /// Stops the engine and returns its final counters.

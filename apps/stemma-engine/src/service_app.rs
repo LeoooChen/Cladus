@@ -101,11 +101,9 @@ fn run(
         }
     };
     // A crash may have left the system's DNS pointing at the forwarder.
-    if let Err(err) = super::restore_dns(&data) {
-        tracing::error!("{err:#}");
-    }
+    super::restore_dns(&data)?;
     let state = data.clone();
-    let controller = Controller::start(
+    let mut controller = Controller::start(
         data.join("config.json"),
         move |config| {
             if !allow_clew && stemma_platform_windows::clew_is_running() {
@@ -140,10 +138,11 @@ fn run(
             }
         }
     });
-    drop(controller);
+    let shutdown = controller.shutdown();
     runtime.shutdown_timeout(Duration::from_secs(2));
     tracing::info!("service stopped");
     result?;
+    shutdown?;
     Ok(())
 }
 

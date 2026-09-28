@@ -27,7 +27,13 @@ allow = [
 # MPL-2.0 is file-level copyleft. It is acceptable only for unmodified
 # transitive dependencies (e.g. Tauri's CSS parser); list each one here
 # explicitly when it appears.
-exceptions = []
+exceptions = [
+    { crate = "cssparser", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short", allow = ["MPL-2.0"] },
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+    { crate = "selectors", allow = ["MPL-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -44,3 +50,7 @@ unknown-git = "deny"
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # Only in the Linux GTK stack of Tauri; the desktop app is built for Windows only.
+    { id = "RUSTSEC-2024-0370", reason = "Linux-only transitive dependency of Tauri (glib-macros)" },
+]

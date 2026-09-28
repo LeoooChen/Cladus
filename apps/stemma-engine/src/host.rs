@@ -37,7 +37,7 @@ impl Client {
 
 pub struct Controller {
     client: Client,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Controller {
@@ -80,7 +80,7 @@ impl Controller {
                     };
                     let _ = reply.send(response);
                 }
-                state.disengage();
+                state.disengage()
             })?;
         Ok(Self {
             client: Client(tx),
@@ -91,13 +91,22 @@ impl Controller {
     pub fn client(&self) -> Client {
         self.client.clone()
     }
+
+    pub fn shutdown(&mut self) -> anyhow::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        let _ = self.client.0.send(Message::Stop);
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("engine control thread panicked"))?
+    }
 }
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        let _ = self.client.0.send(Message::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Err(err) = self.shutdown() {
+            tracing::error!(%err, "engine shutdown did not complete cleanly");
         }
     }
 }
@@ -113,7 +122,10 @@ struct State {
 }
 
 impl State {
-    fn disengage(&mut self) {
+    fn disengage(&mut self) -> anyhow::Result<()> {
+        if let Some(engine) = &mut self.engine {
+            engine.prepare_stop()?;
+        }
         if let Some(engine) = self.engine.take() {
             self.counters = engine
                 .stop()
@@ -121,6 +133,7 @@ impl State {
                 .map(|c| (c.name.to_owned(), c.value))
                 .collect();
         }
+        Ok(())
     }
 
     fn handle(&mut self, request: Request) -> anyhow::Result<Response> {
@@ -149,7 +162,7 @@ impl State {
                 Response::Ok
             }
             Request::Disengage => {
-                self.disengage();
+                self.disengage()?;
                 Response::Ok
             }
             Request::GetConfig => Response::Config(Box::new(self.config.clone())),
@@ -161,7 +174,14 @@ impl State {
                 if let Some(engine) = &mut self.engine {
                     engine.reconfigure(&config)?;
                 }
-                save_config(&self.path, &config)?;
+                if let Err(err) = save_config(&self.path, &config) {
+                    if let Some(engine) = &mut self.engine {
+                        engine.reconfigure(&self.config).with_context(|| {
+                            format!("configuration write failed ({err:#}); rollback also failed")
+                        })?;
+                    }
+                    return Err(err);
+                }
                 (self.applied)(&config);
                 self.config = *config;
                 self.last_error = None;

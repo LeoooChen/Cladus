@@ -74,6 +74,7 @@ struct Shared {
     settings: RwLock<DnsSettings>,
     counters: Arc<DnsCounters>,
     upstream: mpsc::Sender<Query>,
+    changed: tokio::sync::Notify,
 }
 
 struct Query {
@@ -101,6 +102,7 @@ impl DnsForwarder {
             settings: RwLock::new(settings),
             counters,
             upstream: tx,
+            changed: tokio::sync::Notify::new(),
         });
         let mut tasks = JoinSet::new();
         let mut sockets = Vec::new();
@@ -133,6 +135,7 @@ impl DnsForwarder {
 
     pub fn update(&self, settings: DnsSettings) {
         *self.shared.settings.write().unwrap() = settings;
+        self.shared.changed.notify_one();
     }
 
     pub fn fallback(&self) -> Vec<IpAddr> {
@@ -152,8 +155,13 @@ impl Drop for DnsForwarder {
 
 async fn serve_udp(shared: Arc<Shared>, socket: Arc<UdpSocket>) {
     let mut buffer = vec![0u8; 4096];
+    let mut requests = JoinSet::new();
     loop {
-        let (len, client) = match socket.recv_from(&mut buffer).await {
+        let received = tokio::select! {
+            received = socket.recv_from(&mut buffer) => received,
+            Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+        };
+        let (len, client) = match received {
             Ok(received) => received,
             // Windows reports ICMP port-unreachable for earlier sends this way.
             Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
@@ -162,9 +170,13 @@ async fn serve_udp(shared: Arc<Shared>, socket: Arc<UdpSocket>) {
                 return;
             }
         };
+        if requests.len() >= MAX_PENDING {
+            shared.counters.failed.fetch_add(1, Relaxed);
+            continue;
+        }
         let query = buffer[..len].to_vec();
         let (shared, socket) = (Arc::clone(&shared), Arc::clone(&socket));
-        tokio::spawn(async move {
+        requests.spawn(async move {
             let Some(answer) = resolve(&shared, query.clone(), false).await else {
                 return;
             };
@@ -176,15 +188,20 @@ async fn serve_udp(shared: Arc<Shared>, socket: Arc<UdpSocket>) {
 
 async fn serve_tcp(shared: Arc<Shared>, listener: TcpListener) {
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CLIENTS));
+    let mut clients = JoinSet::new();
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            Some(_) = clients.join_next(), if !clients.is_empty() => continue,
+        };
+        let Ok((mut stream, _)) = accepted else {
             continue;
         };
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             continue;
         };
         let shared = Arc::clone(&shared);
-        tokio::spawn(async move {
+        clients.spawn(async move {
             let _permit = permit;
             loop {
                 let Ok(Ok(query)) = timeout(Duration::from_secs(10), read_frame(&mut stream)).await
@@ -194,7 +211,10 @@ async fn serve_tcp(shared: Arc<Shared>, listener: TcpListener) {
                 let Some(answer) = resolve(&shared, query, true).await else {
                     return;
                 };
-                if write_frame(&mut stream, &answer).await.is_err() {
+                if !matches!(
+                    timeout(Duration::from_secs(10), write_frame(&mut stream, &answer)).await,
+                    Ok(Ok(()))
+                ) {
                     return;
                 }
             }
@@ -271,16 +291,88 @@ struct Pending {
     deadline: Instant,
 }
 
+struct Upstream {
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    answers: mpsc::Receiver<Vec<u8>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
 /// Owns the upstream connection and every in-flight query.
 async fn upstream_task(shared: Arc<Shared>, mut queries: mpsc::Receiver<Query>) {
     let mut pending: HashMap<u16, Pending> = HashMap::new();
     let mut next_id: u16 = rand_seed();
-    let mut connection: Option<(tokio::net::tcp::OwnedWriteHalf, mpsc::Receiver<Vec<u8>>)> = None;
+    let mut connection: Option<Upstream> = None;
     let mut failures = 0u32;
     let mut unhealthy_until: Option<Instant> = None;
     loop {
         let next_deadline = pending.values().map(|p| p.deadline).min();
         tokio::select! {
+            // Apply updates before queued queries; drain answers and deadlines
+            // before more sends so sustained input cannot starve either.
+            biased;
+            () = shared.changed.notified() => {
+                connection = None;
+                fail_all(&mut pending);
+                unhealthy_until = None;
+                failures = 0;
+                shared.counters.fallback_active.store(0, Relaxed);
+            }
+            answer = async { connection.as_mut().expect("guarded").answers.recv().await }, if connection.is_some() => {
+                match answer {
+                    Some(mut answer) => {
+                        let id = u16::from_be_bytes([answer[0], answer[1]]);
+                        if let Some(p) = pending.remove(&id) {
+                            failures = 0;
+                            answer[..2].copy_from_slice(&p.id.to_be_bytes());
+                            let _ = p.reply.send(Some(answer));
+                        }
+                    }
+                    None => {
+                        // The resolver closed an idle connection; queries sent
+                        // on it go out again on the next one.
+                        debug!("DNS upstream connection closed");
+                        connection = None;
+                        let settings = shared.settings.read().unwrap().clone();
+                        if !pending.is_empty() {
+                            match open(&settings).await {
+                                Ok(mut opened) => {
+                                    for p in pending.values() {
+                                        if !matches!(timeout(QUERY_TIMEOUT, write_frame(&mut opened.writer, &p.message)).await, Ok(Ok(()))) {
+                                            break;
+                                        }
+                                    }
+                                    connection = Some(opened);
+                                }
+                                Err(_) => fail_all(&mut pending),
+                            }
+                        }
+                    }
+                }
+            }
+            () = async { sleep_until(next_deadline.expect("guarded")).await }, if next_deadline.is_some() => {
+                let now = Instant::now();
+                let expired: Vec<u16> = pending.iter().filter(|(_, p)| p.deadline <= now).map(|(id, _)| *id).collect();
+                for id in expired {
+                    if let Some(p) = pending.remove(&id) {
+                        let _ = p.reply.send(None);
+                    }
+                    failures += 1;
+                }
+                if failures >= FAILURE_LIMIT {
+                    warn!("DNS through the proxy keeps timing out; using the original servers for a while");
+                    failures = 0;
+                    connection = None;
+                    fail_all(&mut pending);
+                    unhealthy_until = Some(now + UNHEALTHY_FOR);
+                    shared.counters.fallback_active.store(1, Relaxed);
+                }
+            }
             query = queries.recv() => {
                 let Some(query) = query else { return };
                 let now = Instant::now();
@@ -312,61 +404,13 @@ async fn upstream_task(shared: Arc<Shared>, mut queries: mpsc::Receiver<Query>) 
                 let mut message = query.message;
                 let original = u16::from_be_bytes([message[0], message[1]]);
                 message[..2].copy_from_slice(&id.to_be_bytes());
-                let (writer, _) = connection.as_mut().expect("connected above");
-                if write_frame(writer, &message).await.is_err() {
+                let writer = &mut connection.as_mut().expect("connected above").writer;
+                if !matches!(timeout(QUERY_TIMEOUT, write_frame(writer, &message)).await, Ok(Ok(()))) {
                     connection = None;
                     let _ = query.reply.send(None);
                     continue;
                 }
                 pending.insert(id, Pending { id: original, message, reply: query.reply, deadline: now + QUERY_TIMEOUT });
-            }
-            answer = async { connection.as_mut().expect("guarded").1.recv().await }, if connection.is_some() => {
-                match answer {
-                    Some(mut answer) => {
-                        let id = u16::from_be_bytes([answer[0], answer[1]]);
-                        if let Some(p) = pending.remove(&id) {
-                            failures = 0;
-                            answer[..2].copy_from_slice(&p.id.to_be_bytes());
-                            let _ = p.reply.send(Some(answer));
-                        }
-                    }
-                    None => {
-                        // The resolver closed an idle connection; queries sent
-                        // on it go out again on the next one.
-                        debug!("DNS upstream connection closed");
-                        connection = None;
-                        let settings = shared.settings.read().unwrap().clone();
-                        if !pending.is_empty() {
-                            match open(&settings).await {
-                                Ok(mut opened) => {
-                                    for p in pending.values() {
-                                        let _ = write_frame(&mut opened.0, &p.message).await;
-                                    }
-                                    connection = Some(opened);
-                                }
-                                Err(_) => fail_all(&mut pending),
-                            }
-                        }
-                    }
-                }
-            }
-            () = async { sleep_until(next_deadline.expect("guarded")).await }, if next_deadline.is_some() => {
-                let now = Instant::now();
-                let expired: Vec<u16> = pending.iter().filter(|(_, p)| p.deadline <= now).map(|(id, _)| *id).collect();
-                for id in expired {
-                    if let Some(p) = pending.remove(&id) {
-                        let _ = p.reply.send(None);
-                    }
-                    failures += 1;
-                }
-                if failures >= FAILURE_LIMIT {
-                    warn!("DNS through the proxy keeps timing out; using the original servers for a while");
-                    failures = 0;
-                    connection = None;
-                    fail_all(&mut pending);
-                    unhealthy_until = Some(now + UNHEALTHY_FOR);
-                    shared.counters.fallback_active.store(1, Relaxed);
-                }
             }
         }
     }
@@ -378,9 +422,7 @@ fn fail_all(pending: &mut HashMap<u16, Pending>) {
     }
 }
 
-async fn open(
-    settings: &DnsSettings,
-) -> io::Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Receiver<Vec<u8>>)> {
+async fn open(settings: &DnsSettings) -> io::Result<Upstream> {
     let proxy = settings
         .proxy
         .as_ref()
@@ -396,14 +438,18 @@ async fn open(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy did not answer in time"))??;
     let (mut reader, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Ok(answer) = read_frame(&mut reader).await {
-            if answer.len() >= HEADER && tx.send(answer).await.is_err() {
+            if answer.len() < HEADER || tx.send(answer).await.is_err() {
                 return;
             }
         }
     });
-    Ok((writer, rx))
+    Ok(Upstream {
+        writer,
+        answers: rx,
+        reader: task,
+    })
 }
 
 async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
@@ -504,6 +550,94 @@ fn skip_name(message: &[u8], mut at: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn tagged_proxy(tag: &'static [u8]) -> Arc<ProxyEndpoint> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = [0u8; 10];
+                    stream.read_exact(&mut head[..3]).await.unwrap();
+                    stream.write_all(&[5, 0]).await.unwrap();
+                    stream.read_exact(&mut head).await.unwrap();
+                    stream
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    while let Ok(query) = read_frame(&mut stream).await {
+                        if write_frame(&mut stream, &answer_for(&query, tag))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        Arc::new(ProxyEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+            credentials: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn reconfiguration_reconnects_and_drop_releases_tcp_clients() {
+        let mut settings = DnsSettings {
+            upstream: "192.0.2.53:53".parse().unwrap(),
+            proxy: Some(tagged_proxy(b"first").await),
+            strict: true,
+            fallback: vec![],
+        };
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = reserve.local_addr().unwrap();
+        drop(reserve);
+        let forwarder = DnsForwarder::start(
+            &Handle::current(),
+            &[listen],
+            settings.clone(),
+            Arc::default(),
+        )
+        .unwrap();
+        let first = resolve(&forwarder.shared, query(1, None), true)
+            .await
+            .unwrap();
+        assert!(first.ends_with(b"first"));
+        let proxies = [settings.proxy.clone(), Some(tagged_proxy(b"second").await)];
+        for i in 0..20 {
+            settings.proxy = proxies[i % 2].clone();
+            forwarder.update(settings.clone());
+            // Queue immediately: reconfiguration and the request are both ready.
+            let answer = resolve(&forwarder.shared, query(i as u16 + 2, None), true)
+                .await
+                .unwrap();
+            let expected: &[u8] = if i % 2 == 0 { b"first" } else { b"second" };
+            assert!(
+                answer.ends_with(expected),
+                "stale DNS upstream after update {i}"
+            );
+        }
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        write_frame(&mut client, &query(3, None)).await.unwrap();
+        assert!(read_frame(&mut client).await.unwrap().ends_with(b"second"));
+        drop(forwarder);
+        let closed = timeout(Duration::from_secs(1), client.read(&mut [0u8; 1]))
+            .await
+            .unwrap();
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if std::net::UdpSocket::bind(listen).is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     /// Query for `example.com A`, with an optional EDNS OPT record.
     fn query(id: u16, edns: Option<u16>) -> Vec<u8> {
@@ -641,6 +775,7 @@ mod tests {
             }),
             counters: counters.clone(),
             upstream: tx,
+            changed: tokio::sync::Notify::new(),
         });
         tokio::spawn(upstream_task(Arc::clone(&shared), rx));
         // `direct` always uses port 53; test it separately against the resolver.
