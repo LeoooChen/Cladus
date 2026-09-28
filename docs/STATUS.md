@@ -71,6 +71,6 @@ configure the proxy endpoint and process rules after installing.
   creating a loopback wakeup connection.
 - Fragmented/IPsec traffic is not relayed. Interception is fail-open; DNS falls
   back to original resolvers unless strict mode is selected.
-- Code signing and public release publication are not configured. Native tray
+- Code signing is not configured. Native tray
   recovery after Explorer restart and physical mixed-DPI monitor changes still
   require manual acceptance; browser mocks do not establish those results.
