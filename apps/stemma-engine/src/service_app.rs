@@ -107,7 +107,9 @@ fn run(
         data.join("config.json"),
         move |config| {
             if !allow_clew && stemma_platform_windows::clew_is_running() {
-                bail!("Clew is running; exit it before engaging the Stemma service");
+                bail!(
+                    "Another traffic redirector is running; exit it before engaging the Stemma service"
+                );
             }
             super::start(config, Some(&divert), &state)
         },

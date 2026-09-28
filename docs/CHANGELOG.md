@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 — 2026-09-28
+
+- Remove old-project branding and repository links from the About section.
+- Use product-neutral wording for installer import options, conflict messages,
+  CLI help and import results. The public import command is now `import-config`;
+  its previous spelling remains accepted for existing scripts.
+- Preserve compatibility detection/import behavior and required third-party
+  copyright and license notices.
+
 ## 0.1.1 — 2026-09-28
 
 - Fix service shutdown hanging on a blocking TCP accept after its loopback

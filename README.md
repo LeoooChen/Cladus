@@ -4,7 +4,7 @@ Windows per-process TCP/UDP proxying in Rust, without TUN or DLL injection.
 Rules follow a process's descendants, including children that outlive their
 launcher. WinDivert redirects traffic to a SOCKS5 server.
 
-Windows 0.1.1 includes the service, desktop GUI, DNS forwarding, Clew importer
+Windows 0.1.2 includes the service, desktop GUI, DNS forwarding, configuration import
 and installer. See [verification status](docs/STATUS.md) for tested behavior
 and remaining release checks. Linux/macOS backends are deferred; portable
 logic remains separated in `stemma-core`.
@@ -12,14 +12,14 @@ logic remains separated in `stemma-core`.
 ## Install and use
 
 Requires Windows 10 2004 (build 19041) or newer, x64. Run
-`stemma-0.1.1-windows-x64-setup.exe` as administrator. Setup installs WebView2
+`stemma-0.1.2-windows-x64-setup.exe` as administrator. Setup installs WebView2
 if missing (Internet access needed), registers the Stemma Engine service and
 starts it **idle**. Subsequent GUI launches do not need elevation for Windows
 administrators using their normal UAC token. Standard users who are not members
 of Administrators cannot control the engine.
 
-1. Exit Clew before starting Stemma. The service refuses to engage while Clew
-   runs, because both applications redirect traffic. Also turn off the upstream
+1. Exit other traffic redirectors before starting Stemma to avoid overlapping
+   interception. Also turn off the upstream
    client's TUN mode; keep its SOCKS5 listener running. Stemma supplies per-process
    routing itself. Mihomo TUN coexistence caused intercepted TCP connections to
    stall on the tested Windows host, even when the target IP was correct.
@@ -105,18 +105,18 @@ Use the actual install path if customized. `restore-dns --data-dir <directory>`
 supports custom data directories. Check engine logs if recovery reports an
 error and retry uninstall after resolving it.
 
-## Import from Clew
+## Import compatible configuration
 
-First setup offers import when it finds an installed Clew configuration and no
+First setup offers import when it finds an installed compatible configuration and no
 Stemma configuration exists. For explicit import (administrator):
 
 ```powershell
-& "$env:ProgramFiles\Stemma\stemma-engine.exe" import-clew --from 'C:\path\clew.json'
+& "$env:ProgramFiles\Stemma\stemma-engine.exe" import-config --from 'C:\path\config-v2.json'
 ```
 
-Imports Clew v2 groups, rules, destination filters and DNS settings, leaves the
+Imports compatible v2 groups, rules, destination filters and DNS settings, leaves the
 source untouched and saves the previous Stemma configuration as `.bak`.
-Unsupported entries produce warnings; review the resulting settings. Clew UI
+Unsupported entries produce warnings; review the resulting settings. Source UI
 preferences are not imported.
 
 ## Build

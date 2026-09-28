@@ -34,9 +34,10 @@ enum Command {
     /// Restores system DNS settings left redirected by a crash (administrator).
     RestoreDns(DataArgs),
     #[cfg(windows)]
-    /// Imports a Clew `clew.json` as the service configuration (administrator).
+    /// Imports a compatible version 2 JSON file as service configuration (administrator).
+    #[command(name = "import-config", alias = "import-clew")]
     ImportClew {
-        /// The Clew configuration file; it is only read.
+        /// The compatible configuration file; it is only read.
         #[arg(long)]
         from: PathBuf,
         #[command(flatten)]
@@ -268,7 +269,7 @@ fn import_clew(from: &Path, data: &Path) -> anyhow::Result<()> {
         stemma_engine::host::save_config(&data.join("config.json"), &imported.config)?;
     }
     println!(
-        "Imported {} rule(s) and {} proxy group(s) from Clew.",
+        "Imported {} rule(s) and {} proxy group(s).",
         imported.config.rules.len(),
         imported.config.proxy_groups.len()
     );
@@ -298,7 +299,7 @@ fn start(config: &Config, windivert_dir: Option<&Path>, data: &Path) -> anyhow::
     }
     if clew_is_running() {
         tracing::warn!(
-            "Clew is running and redirects traffic too; Stemma sees packets first, \
+            "Another traffic redirector is running; Stemma sees packets first, \
              but rules of both must not cover the same programs"
         );
     }

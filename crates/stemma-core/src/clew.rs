@@ -23,21 +23,21 @@ pub struct Imported {
 pub fn import_clew(json: &str) -> Result<Imported, String> {
     let root: Value = serde_json::from_str(json).map_err(|err| format!("not valid JSON: {err}"))?;
     if !root.is_object() {
-        return Err("not a Clew configuration".to_owned());
+        return Err("not a compatible configuration".to_owned());
     }
     if let Some(version) = root.get("version") {
         if version.as_u64() != Some(2) {
-            return Err("only Clew configuration version 2 is supported".to_owned());
+            return Err("only compatible configuration version 2 can be imported".to_owned());
         }
     } else if !["default_proxy", "proxy_groups", "auto_rules"]
         .iter()
         .any(|key| root.get(key).is_some())
     {
-        return Err("not a Clew configuration".to_owned());
+        return Err("not a compatible configuration".to_owned());
     }
     for key in ["proxy_groups", "auto_rules", "default_exclude_cidrs"] {
         if root.get(key).is_some_and(|value| !value.is_array()) {
-            return Err(format!("Clew `{key}` must be an array"));
+            return Err(format!("imported `{key}` must be an array"));
         }
     }
     let mut warnings = Vec::new();

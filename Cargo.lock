@@ -3541,7 +3541,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stemma-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ipnet",
  "serde",
@@ -3552,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-e2e"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3583,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-gui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "png 0.17.16",
  "serde",
@@ -3602,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-ipc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3612,7 +3612,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-platform-windows"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "socket2",

@@ -36,10 +36,10 @@ Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
 [CustomMessages]
 english.PrerequisiteError=Could not install %1 (error %2). Check your Internet connection and retry.
 chinesesimp.PrerequisiteError=无法安装 %1（错误 %2）。请检查网络连接后重试。
-english.ImportClew=Import rules and proxy groups from the installed Clew
-chinesesimp.ImportClew=导入已安装 Clew 的规则与代理组
-english.ClewRunning=Clew is running. Both programs redirect traffic and must not run at the same time. Exit Clew before using Stemma.
-chinesesimp.ClewRunning=Clew 正在运行。两者都会重定向流量，不能同时运行。使用 Stemma 前请先退出 Clew。
+english.ImportConfig=Import rules and proxy groups from a detected compatible configuration
+chinesesimp.ImportConfig=从检测到的兼容配置中导入规则与代理组
+english.RedirectorRunning=Another traffic redirector is running. Exit it before using Stemma to avoid conflicts.
+chinesesimp.RedirectorRunning=另一个流量代理程序正在运行。请先退出该程序再使用 Stemma，以免发生冲突。
 english.EngineFailed=The Stemma Engine service could not be set up (error %1).
 chinesesimp.EngineFailed=无法安装 Stemma Engine 服务（错误 %1）。
 english.RecoveryFailed=Stemma could not stop safely or restore DNS (error %1). Recovery files have been kept. Resolve the error and retry.
@@ -47,7 +47,7 @@ chinesesimp.RecoveryFailed=Stemma 无法安全停止或恢复 DNS（错误 %1）
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "importclew"; Description: "{cm:ImportClew}"; Check: CanImportClew
+Name: "importclew"; Description: "{cm:ImportConfig}"; Check: CanImportClew
 
 [Files]
 Source: "{#Bin}\stemma.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -143,7 +143,7 @@ begin
     if Code <> 0 then
       RaiseException(FmtMessage(CustomMessage('EngineFailed'), [IntToStr(Code)]));
     if WizardIsTaskSelected('importclew') then begin
-      Code := RunHidden(Engine, 'import-clew --from "' + ClewConfigPath + '"');
+      Code := RunHidden(Engine, 'import-config --from "' + ClewConfigPath + '"');
       if Code <> 0 then
         RaiseException(FmtMessage(CustomMessage('EngineFailed'), [IntToStr(Code)]));
     end;
@@ -151,7 +151,7 @@ begin
     if Code <> 0 then
       RaiseException(FmtMessage(CustomMessage('EngineFailed'), [IntToStr(Code)]));
     if CheckForMutexes('Global\Clew_SingleInstance') then
-      SuppressibleMsgBox(CustomMessage('ClewRunning'), mbInformation, MB_OK, IDOK);
+      SuppressibleMsgBox(CustomMessage('RedirectorRunning'), mbInformation, MB_OK, IDOK);
   end;
 end;
 

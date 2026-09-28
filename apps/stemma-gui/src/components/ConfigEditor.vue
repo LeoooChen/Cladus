@@ -520,10 +520,7 @@ onUnmounted(() => {
               Stemma <span class="font-mono text-slate-700 dark:text-slate-300">v{{ STEMMA_VERSION }}</span>
             </p>
             <p class="text-xs text-slate-500 dark:text-slate-400">
-              {{ t('Windows process-level traffic proxy') }} ·
-              {{ t('A Rust rewrite of Clew') }}
-              (<a href="https://github.com/ymonster/clew-proxy" target="_blank" class="text-blue-600 dark:text-blue-400 hover:underline">ymonster/clew-proxy</a>,
-              <a href="https://github.com/LeoooChen/clew-proxy" target="_blank" class="text-blue-600 dark:text-blue-400 hover:underline">LeoooChen/clew-proxy</a>)
+              {{ t('Windows process-level traffic proxy') }}
             </p>
           </div>
         </div>
