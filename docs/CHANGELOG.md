@@ -7,6 +7,8 @@
   variables, configuration directories, installer, shortcuts and documentation.
 - Use a new installer AppId and fresh Cladus settings. No old-product migration
   or automatic configuration import is performed during installation.
+- Allow up to 150 ms for a new TCP connection's process decision before the
+  fail-open SYN watchdog releases it directly on slower Windows hosts.
 
 ## 0.1.2 — 2026-09-28
 

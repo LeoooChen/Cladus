@@ -232,7 +232,7 @@ impl Default for SynParking {
     fn default() -> Self {
         Self {
             enabled: true,
-            watchdog_ms: 20,
+            watchdog_ms: 150,
             pool_size: 256,
         }
     }
@@ -419,8 +419,8 @@ impl Config {
             problems.push("dns.upstream must be a resolver address and port".to_owned());
         }
         let parking = &self.tcp_syn_parking;
-        if !(5..=50).contains(&parking.watchdog_ms) {
-            problems.push("tcp_syn_parking.watchdog_ms must be between 5 and 50".to_owned());
+        if !(5..=500).contains(&parking.watchdog_ms) {
+            problems.push("tcp_syn_parking.watchdog_ms must be between 5 and 500".to_owned());
         }
         if !(32..=4096).contains(&parking.pool_size) {
             problems.push("tcp_syn_parking.pool_size must be between 32 and 4096".to_owned());
@@ -499,7 +499,7 @@ mod tests {
         let json = r#"{
             "proxy_groups": [{"id": 1, "host": ""}, {"id": 1, "host": "h", "port": 1}],
             "rules": [{"id": "a", "proxy_group_id": 7}, {"id": "a", "proxy_group_id": 1}],
-            "tcp_syn_parking": {"watchdog_ms": 100}
+            "tcp_syn_parking": {"watchdog_ms": 501}
         }"#;
         let ConfigError::Invalid(message) = Config::from_json(json).unwrap_err() else {
             panic!("expected a validation error");
