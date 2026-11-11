@@ -28,6 +28,8 @@
   "Mode": "模式",
   "Upstream": "上游服务器",
   "DNS server": "DNS 服务器",
+  "IPv6 connection fallback": "IPv6 连接回退",
+  "Retry failed IPv6 TLS handshakes over IPv4 when the hostname can be verified. Established streams and early data are never replayed.": "IPv6 的 TLS 握手失败时，在能验证域名的情况下尝试 IPv4。不会重放已经建立的流式连接或 TLS 早期数据。",
   "Log Level": "日志级别",
   "Log level": "日志级别",
   "Runtime log verbosity. Switching takes effect immediately, no restart needed.": "调整日志详细程度，切换后立即生效，无需重启。",

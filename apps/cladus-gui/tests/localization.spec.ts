@@ -4,7 +4,7 @@ import { test, expect, type Page } from '@playwright/test'
 // the test process, so it survives page reloads.
 async function mockBackend(page: Page, language = 'system', failSave = false, connections: unknown[] = [], checkProxy?: () => Promise<{ reachable: boolean; error?: string }>) {
   const prefs = { language, close_to_tray: false, start_minimized: false }
-  const config = { version: 1, proxy_groups: [], rules: [], log_level: 'info', dns: { enabled: false, upstream: '8.8.8.8:53', strict: false } }
+  const config = { version: 1, proxy_groups: [], rules: [], tcp_ipv6_fallback: true, log_level: 'info', dns: { enabled: false, upstream: '8.8.8.8:53', strict: false } }
   const groups = [{ id: 0, name: 'default', host: '127.0.0.1', port: 7890, type: 'socks5', test_url: 'https://example.com' }]
   await page.exposeFunction('__mockInvoke', (cmd: string, args: Record<string, unknown>) => {
     switch (cmd) {
@@ -17,6 +17,10 @@ async function mockBackend(page: Page, language = 'system', failSave = false, co
       case 'get_stats': return { hijacked_pids: 0, auto_rules_count: 0 }
       case 'get_autostart': return { enabled: false, start_minimized: false }
       case 'get_config': return config
+      case 'update_config':
+        if (failSave) throw new Error('Save failed')
+        Object.assign(config, args.config)
+        return null
       case 'list_groups': return groups
       case 'update_group': Object.assign(groups[0]!, args.group); return null
       case 'check_group': return checkProxy ? checkProxy() : { reachable: true }
@@ -53,6 +57,33 @@ async function settings(page: Page, label = '设置') {
   await page.getByRole('button', { name: label, exact: true }).click()
   await expect(page.getByLabel(label === 'Settings' ? 'Language' : '语言', { exact: true })).toBeVisible()
 }
+
+test('IPv6 fallback can be disabled, persisted and enabled without touching DNS', async ({ page }) => {
+  await mockBackend(page)
+  await page.goto('/')
+  await settings(page)
+  const fallback = page.getByLabel('IPv6 连接回退', { exact: true })
+  await expect(fallback).toBeChecked()
+  await fallback.uncheck()
+  await expect(fallback).toBeEnabled()
+  await expect(fallback).not.toBeChecked()
+  await page.reload()
+  await settings(page)
+  await expect(fallback).not.toBeChecked()
+  await fallback.check()
+  await expect(fallback).toBeEnabled()
+  await expect(fallback).toBeChecked()
+})
+
+test('failed IPv6 fallback save restores the actual setting', async ({ page }) => {
+  await mockBackend(page, 'zh-CN', true)
+  await page.goto('/')
+  await settings(page)
+  const fallback = page.getByLabel('IPv6 连接回退', { exact: true })
+  await fallback.uncheck()
+  await expect(page.getByRole('alert')).toContainText('保存失败')
+  await expect(fallback).toBeChecked()
+})
 
 test('system Chinese, translated dialogs and settings at native scale', async ({ page }, info) => {
   await mockBackend(page)

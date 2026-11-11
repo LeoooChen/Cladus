@@ -23,6 +23,9 @@ pub struct Config {
     /// Destinations that are never proxied, whatever the rules say.
     pub global_exclude_cidrs: Vec<Cidr>,
     pub tcp_syn_parking: SynParking,
+    /// Retry an IPv6 TLS connection over IPv4 only before any server response
+    /// or application data. Requires a DNS-verified hostname from ClientHello.
+    pub tcp_ipv6_fallback: bool,
     pub dns: DnsConfig,
     pub log_level: LogLevel,
 }
@@ -45,6 +48,7 @@ impl Default for Config {
                 .map(|s| s.parse().expect("built-in CIDR is valid"))
                 .collect(),
             tcp_syn_parking: SynParking::default(),
+            tcp_ipv6_fallback: true,
             dns: DnsConfig::default(),
             log_level: LogLevel::default(),
         }
@@ -455,6 +459,12 @@ mod tests {
         assert_eq!(rule.protocol, RuleProtocol::Both);
         assert_eq!(rule.proxy_group_id, GroupId(0));
         assert_eq!(config.proxy_groups, vec![ProxyGroup::default()]);
+        assert!(config.tcp_ipv6_fallback);
+        assert!(
+            !Config::from_json(r#"{"tcp_ipv6_fallback": false}"#)
+                .unwrap()
+                .tcp_ipv6_fallback
+        );
     }
 
     #[test]
