@@ -83,7 +83,7 @@ pub fn pool_tag(generation: u32) -> u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Proxied { group: u32 },
+    Proxied { group: u32, policy: u32 },
     Direct,
 }
 
@@ -109,6 +109,7 @@ pub struct Taken {
     pub remote_ip: IpAddr,
     pub remote_port: u16,
     pub group: u32,
+    pub policy: u32,
 }
 
 #[derive(Default)]
@@ -123,6 +124,7 @@ struct Slot {
     remote_ip: [AtomicU64; 2],
     remote_port: AtomicU32,
     group: AtomicU32,
+    policy: AtomicU32,
     /// Initial sequence number of the last SYN handled on this port.
     syn_seq: AtomicU32,
 }
@@ -256,9 +258,9 @@ impl PortTracker {
         connect_ts: i64,
     ) -> Publish {
         let slot = self.slot(port);
-        let (state, group) = match decision {
-            Decision::Proxied { group } => (SlotState::Proxied, group),
-            Decision::Direct => (SlotState::Direct, 0),
+        let (state, group, policy) = match decision {
+            Decision::Proxied { group, policy } => (SlotState::Proxied, group, policy),
+            Decision::Direct => (SlotState::Direct, 0, 0),
         };
         loop {
             let current = Word(slot.word.load(Acquire));
@@ -271,6 +273,7 @@ impl PortTracker {
             slot.store_remote(remote_ip);
             slot.remote_port.store(u32::from(remote_port), Relaxed);
             slot.group.store(group, Relaxed);
+            slot.policy.store(policy, Relaxed);
             let decided = Word::new(state, self.next_tag(), NO_INDEX);
             if slot
                 .word
@@ -323,6 +326,7 @@ impl PortTracker {
             remote_ip: slot.remote(),
             remote_port: slot.remote_port.load(Relaxed) as u16,
             group: slot.group.load(Relaxed),
+            policy: slot.policy.load(Relaxed),
         })
     }
 
@@ -343,7 +347,10 @@ mod tests {
 
     const TTL: i64 = 100;
     const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
-    const PROXY: Decision = Decision::Proxied { group: 7 };
+    const PROXY: Decision = Decision::Proxied {
+        group: 7,
+        policy: 9,
+    };
 
     #[test]
     fn word_packing() {
@@ -360,8 +367,13 @@ mod tests {
         assert_eq!(t.publish(5000, PROXY, IP, 443, 10), Publish::Stored);
         let taken = t.take(5000).unwrap();
         assert_eq!(
-            (taken.remote_ip, taken.remote_port, taken.group),
-            (IP, 443, 7)
+            (
+                taken.remote_ip,
+                taken.remote_port,
+                taken.group,
+                taken.policy
+            ),
+            (IP, 443, 7, 9)
         );
         assert_eq!(t.proxied_remote_port(5000), Some(443));
         assert_eq!(

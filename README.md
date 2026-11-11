@@ -8,7 +8,7 @@ Windows per-process TCP/UDP proxying in Rust, without TUN or DLL injection.
 Rules follow a process's descendants, including children that outlive their
 launcher. WinDivert redirects traffic to a SOCKS5 server.
 
-Windows 0.1.3 includes the service, desktop GUI, DNS forwarding, configuration import
+Windows 0.1.4 includes the service, desktop GUI, DNS forwarding, configuration import
 and installer. See [verification status](docs/STATUS.md) for tested behavior
 and remaining release checks. Linux/macOS backends are deferred; portable
 logic remains separated in `cladus-core`.
@@ -16,7 +16,7 @@ logic remains separated in `cladus-core`.
 ## Install and use
 
 Requires Windows 10 2004 (build 19041) or newer, x64. Run
-`cladus-0.1.3-windows-x64-setup.exe` as administrator. Setup installs WebView2
+`cladus-0.1.4-windows-x64-setup.exe` as administrator. Setup installs WebView2
 if missing (Internet access needed), registers the Cladus Engine service and
 starts it **idle**. Subsequent GUI launches do not need elevation for Windows
 administrators using their normal UAC token. Standard users who are not members
@@ -65,6 +65,25 @@ Existing proxied TCP connections cannot survive an engine stop. A crashed
 service restarts, restores DNS and starts idle; a running GUI then reconnects
 and engages it again.
 
+**IPv6 connection fallback** is enabled by default. For TCP port 443, Cladus can
+retry a failed IPv6 TLS handshake using up to two IPv4 addresses, before any
+server response or application data. It verifies the ClientHello hostname and
+original IPv6 address through SOCKS5 DNS, and checks the original rule's filters
+for each alternate. Healthy IPv6, DNS replies and existing streams stay intact.
+The original failure and fallback outcome are logged; `relay.ipv4_fallback_*`
+counters expose attempts, selections and failures. The fallback stage is bounded
+to 12 seconds, with a 3-second first-response timeout per tunnel.
+
+Disable it in Settings or with `tcp_ipv6_fallback: false`. No fallback is made
+for TLS early data (0-RTT), ECH, missing/unverifiable hostnames, other ports,
+non-TLS traffic, or after any server bytes arrive. Certificate verification stays
+with the application. This does not retry interrupted API responses or POSTs.
+The fallback DNS lookup uses `dns.upstream` through the flow's own proxy group,
+without requiring or modifying system-wide DNS redirection.
+
+Independent local API gateways (for example `magpie.exe`) need their own process
+rule: receiving a loopback request from ChatGPT does not make a gateway its child.
+
 ## Configuration and recovery
 
 | Location | Contents |
@@ -90,6 +109,7 @@ avoid editing its file while running.
   link-local, multicast and broadcast destinations are always direct.
 - `tcp_syn_parking`: bounded first-packet parking. Changing it requires an idle
   engine; exit the GUI before CLI `disengage`/`set-config`.
+- `tcp_ipv6_fallback`: bounded TLS handshake fallback, enabled by default.
 - `dns`: `enabled`, `upstream` (IP:port), `proxy_group_id`, `strict`.
 - `log_level`: `trace`, `debug`, `info`, `warn`, `error`.
 
@@ -203,11 +223,11 @@ directory. The design and future scope are in [docs/DESIGN.md](docs/DESIGN.md).
 
 Cladus 是用 Rust 开发的 Windows 按进程 TCP/UDP 代理工具，无需 TUN 或 DLL 注入。规则会跟随目标进程的子进程，即使启动器已经退出也有效；程序通过 WinDivert 将流量转发到 SOCKS5 服务器。
 
-Windows 0.1.3 包含系统服务、桌面界面、DNS 转发、配置导入和安装程序。已验证的功能及待完成的发布检查见[验证状态](docs/STATUS.md)。Linux/macOS 后端暂未实现；可移植逻辑放在 `cladus-core` 中。
+Windows 0.1.4 包含系统服务、桌面界面、DNS 转发、配置导入和安装程序。已验证的功能及待完成的发布检查见[验证状态](docs/STATUS.md)。Linux/macOS 后端暂未实现；可移植逻辑放在 `cladus-core` 中。
 
 ### 安装与使用
 
-需要 Windows 10 2004（内部版本 19041）或更新版本，x64。以管理员身份运行 `cladus-0.1.3-windows-x64-setup.exe`。安装程序会在缺少 WebView2 时安装它（需要联网），注册 Cladus Engine 服务并使其以**空闲**状态启动。此后，Windows 管理员使用普通 UAC 令牌即可启动界面，无需再次提权；非管理员标准用户无法控制引擎。
+需要 Windows 10 2004（内部版本 19041）或更新版本，x64。以管理员身份运行 `cladus-0.1.4-windows-x64-setup.exe`。安装程序会在缺少 WebView2 时安装它（需要联网），注册 Cladus Engine 服务并使其以**空闲**状态启动。此后，Windows 管理员使用普通 UAC 令牌即可启动界面，无需再次提权；非管理员标准用户无法控制引擎。
 
 代理运行期间，引擎会添加一条 Windows Defender 防火墙入站 TCP 规则，仅适用于引擎程序和临时重定向监听端口。正常停止时会删除该规则；服务崩溃后重启时会清理遗留规则。如果系统策略禁止添加该规则，TCP 拦截将无法启动。
 
@@ -223,6 +243,12 @@ Windows 0.1.3 包含系统服务、桌面界面、DNS 转发、配置导入和�
 打开界面会使引擎开始工作。默认情况下，关闭窗口仅隐藏到托盘；选择**退出**会停止代理、恢复 DNS，并让服务保持空闲。若无法确认正常关闭，界面会留在屏幕上并报告错误。引擎停止后，已有的代理 TCP 连接会断开。服务崩溃后会自动重启、恢复 DNS 并保持空闲；正在运行的界面会重新连接并再次启用引擎。
 
 ### 配置与恢复
+
+**IPv6 连接回退**默认开启：TCP 443 的 IPv6 TLS 握手失败时，在尚未收到服务端响应、未发送业务数据的阶段，验证域名与原 IPv6 地址后尝试最多两个 IPv4 地址，且仍遵守原规则的地址过滤。正常 IPv6、DNS 答案和已建立的流式连接不会被改写。原始错误和回退结果均记录日志，可通过 `relay.ipv4_fallback_*` 计数查看。回退阶段最多 12 秒，每条隧道等待首次响应最多 3 秒。
+
+可在设置中关闭，或设置 `tcp_ipv6_fallback: false`。TLS 早期数据（0-RTT）、ECH、无法验证域名、其他端口、非 TLS 协议，以及已经收到服务端数据的连接均不回退。证书仍由应用验证，不会重放中断的 API 流或 POST。回退时通过当前进程的代理组查询 `dns.upstream`，不要求启用系统 DNS 代理，也不修改系统 DNS 设置。
+
+独立启动的本机 API 网关（例如 `magpie.exe`）需要单独的进程规则：ChatGPT 向本机端口发送请求，并不会使该网关成为 ChatGPT 的子进程。
 
 | 位置 | 内容 |
 | --- | --- |

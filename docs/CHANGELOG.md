@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.4 — 2026-11-11
+
+- Add bounded IPv6-to-IPv4 fallback for TLS connections on port 443, enabled by
+  default and configurable in Settings or `tcp_ipv6_fallback`. Only an intact
+  ClientHello without early data/ECH can be retried, before any server response.
+- Verify the original IPv6 address and candidate IPv4 addresses against the
+  ClientHello hostname using DNS over the same SOCKS5 proxy. Preserve each
+  connection's destination policy when considering an alternate address.
+- Keep healthy IPv6 connections, system DNS answers and established streams
+  unchanged. Log the original failure and track fallback attempts, selections
+  and failures. Do not retry mid-stream POSTs or replay application data.
+- Update DOMPurify to 3.4.17, source-map-js to 1.2.2 and Vite to 7.3.8 to resolve
+  the existing frontend dependency advisories. No other npm packages changed.
+
+- Preserve TCP tunnel read/write errors after SOCKS5 negotiation. Previously,
+  connection resets were converted to a successful `(0, 0)` result, omitted
+  from `relay.failed` and logged as a finished relay. Clean EOF and half-close
+  remain normal completion. This improves error reporting; it does not restore
+  connectivity on an upstream proxy with a failing IPv6 path.
+
 ## 0.1.3 — 2026-09-28
 
 - Name the product Cladus throughout the workspace, crates, executable names,

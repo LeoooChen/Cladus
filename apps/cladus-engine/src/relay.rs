@@ -7,15 +7,20 @@ use std::time::Duration;
 
 use cladus_core::config::ProxyGroup;
 use cladus_core::platform::Counter;
-use tokio::io::copy_bidirectional_with_sizes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::socks5::{self, Credentials, Socks5Error};
+use crate::{fallback_dns, tls_hello};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const BUFFER_SIZE: usize = 64 * 1024;
+
+#[cfg(test)]
+#[path = "relay_fallback_tests.rs"]
+mod fallback_tests;
 
 /// SOCKS5 reachability/authentication only, without contacting a website.
 pub async fn check_proxy(proxy: &ProxyEndpoint) -> Result<(), String> {
@@ -59,6 +64,10 @@ pub enum RelayError {
     Timeout(String),
     #[error(transparent)]
     Socks5(#[from] Socks5Error),
+    #[error("tunnel data transfer failed: {0}")]
+    Transfer(#[source] std::io::Error),
+    #[error("IPv6 connection failed ({original}); IPv4 fallback failed: {fallback}")]
+    Fallback { original: String, fallback: String },
 }
 
 #[derive(Default)]
@@ -68,6 +77,9 @@ pub struct RelayCounters {
     pub active: AtomicI64,
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
+    pub ipv4_fallback_attempted: AtomicU64,
+    pub ipv4_fallback_selected: AtomicU64,
+    pub ipv4_fallback_failed: AtomicU64,
 }
 
 impl RelayCounters {
@@ -93,6 +105,18 @@ impl RelayCounters {
                 name: "relay.bytes_down",
                 value: self.bytes_down.load(Relaxed),
             },
+            Counter {
+                name: "relay.ipv4_fallback_attempted",
+                value: self.ipv4_fallback_attempted.load(Relaxed),
+            },
+            Counter {
+                name: "relay.ipv4_fallback_selected",
+                value: self.ipv4_fallback_selected.load(Relaxed),
+            },
+            Counter {
+                name: "relay.ipv4_fallback_failed",
+                value: self.ipv4_fallback_failed.load(Relaxed),
+            },
         ]
     }
 }
@@ -104,6 +128,157 @@ pub async fn relay(
     proxy: &ProxyEndpoint,
     target: SocketAddr,
 ) -> Result<(u64, u64), RelayError> {
+    let mut upstream = open_tunnel(proxy, target).await?;
+    let _ = client.set_nodelay(true);
+    copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
+        .await
+        .map_err(RelayError::Transfer)
+}
+
+/// A per-flow snapshot; alternates must satisfy the same current destination
+/// policy as the original connection. DNS is always queried through this proxy.
+pub struct Ipv6Fallback<'a> {
+    pub resolver: SocketAddr,
+    pub allows: &'a (dyn Fn(SocketAddr) -> bool + Send + Sync),
+    pub counters: &'a RelayCounters,
+}
+
+pub async fn relay_with_fallback(
+    mut client: TcpStream,
+    proxy: &ProxyEndpoint,
+    target: SocketAddr,
+    fallback: Ipv6Fallback<'_>,
+) -> Result<(u64, u64), RelayError> {
+    let std::net::IpAddr::V6(original_ip) = target.ip() else {
+        return relay(client, proxy, target).await;
+    };
+    if original_ip.to_ipv4_mapped().is_some() || target.port() != 443 {
+        return relay(client, proxy, target).await;
+    }
+    let _ = client.set_nodelay(true);
+    let original = open_tunnel(proxy, target).await;
+    let (hello, hostname) = read_client_hello(&mut client).await?;
+    let Some(hostname) = hostname else {
+        let mut upstream = original?;
+        upstream
+            .write_all(&hello)
+            .await
+            .map_err(RelayError::Transfer)?;
+        let (up, down) =
+            copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
+                .await
+                .map_err(RelayError::Transfer)?;
+        return Ok((up + hello.len() as u64, down));
+    };
+    let first = match original {
+        Ok(stream) => first_response(stream, &hello).await,
+        Err(error) => Err(error),
+    };
+    let (mut upstream, byte) = match first {
+        Ok(connected) => connected,
+        Err(original_error) => {
+            fallback
+                .counters
+                .ipv4_fallback_attempted
+                .fetch_add(1, Relaxed);
+            tracing::warn!(%target, %hostname, error = %original_error, "IPv6 failed before TLS response; checking IPv4 fallback");
+            let attempt = timeout(Duration::from_secs(12), async {
+                let addresses = fallback_dns::candidates(proxy, fallback.resolver, &hostname, original_ip, target.port())
+                    .await.map_err(|err| err.to_string())?;
+                let mut last = "no IPv4 destination allowed by the original rule".to_owned();
+                for address in addresses.into_iter().filter(|a| (fallback.allows)(*a)).take(2) {
+                    let result = match open_tunnel(proxy, address).await {
+                        Ok(stream) => first_response(stream, &hello).await,
+                        Err(err) => Err(err),
+                    };
+                    match result {
+                        Ok(connected) => {
+                            tracing::info!(%target, %address, %hostname, "IPv4 fallback received first TLS response");
+                            return Ok(connected);
+                        }
+                        Err(err) => last = format!("{address}: {err}"),
+                    }
+                }
+                Err(last)
+            }).await.unwrap_or_else(|_| Err("fallback deadline exceeded".into()));
+            match attempt {
+                Ok(connected) => {
+                    fallback
+                        .counters
+                        .ipv4_fallback_selected
+                        .fetch_add(1, Relaxed);
+                    connected
+                }
+                Err(error) => {
+                    fallback.counters.ipv4_fallback_failed.fetch_add(1, Relaxed);
+                    return Err(RelayError::Fallback {
+                        original: original_error.to_string(),
+                        fallback: error,
+                    });
+                }
+            }
+        }
+    };
+    // Once even one server byte arrives, never retry this connection. Encrypted
+    // application data and streaming POSTs are relayed exactly once.
+    client
+        .write_all(&[byte])
+        .await
+        .map_err(RelayError::Transfer)?;
+    let (up, down) =
+        copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
+            .await
+            .map_err(RelayError::Transfer)?;
+    Ok((up + hello.len() as u64, down + 1))
+}
+
+async fn read_client_hello(
+    client: &mut TcpStream,
+) -> Result<(Vec<u8>, Option<String>), RelayError> {
+    let mut bytes = Vec::new();
+    let result = timeout(Duration::from_secs(1), async {
+        loop {
+            match tls_hello::inspect(&bytes) {
+                tls_hello::Hello::Pass => return Ok::<_, RelayError>(None),
+                tls_hello::Hello::Retryable(host) => return Ok(Some(host)),
+                tls_hello::Hello::More => {}
+            }
+            let mut chunk = [0u8; 4096];
+            let space = (tls_hello::MAX_HELLO - bytes.len()).min(chunk.len());
+            if space == 0 {
+                return Ok(None);
+            }
+            let n = client
+                .read(&mut chunk[..space])
+                .await
+                .map_err(RelayError::Transfer)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await;
+    Ok((bytes, result.unwrap_or(Ok(None))?))
+}
+
+async fn first_response(
+    mut upstream: TcpStream,
+    hello: &[u8],
+) -> Result<(TcpStream, u8), RelayError> {
+    timeout(Duration::from_secs(3), async {
+        upstream
+            .write_all(hello)
+            .await
+            .map_err(RelayError::Transfer)?;
+        let byte = upstream.read_u8().await.map_err(RelayError::Transfer)?;
+        Ok((upstream, byte))
+    })
+    .await
+    .map_err(|_| RelayError::Timeout("TLS first response".into()))?
+}
+
+async fn open_tunnel(proxy: &ProxyEndpoint, target: SocketAddr) -> Result<TcpStream, RelayError> {
     let name = format!("{}:{}", proxy.host, proxy.port);
     let mut upstream = match timeout(
         CONNECT_TIMEOUT,
@@ -115,7 +290,6 @@ pub async fn relay(
         Ok(Err(err)) => return Err(RelayError::Connect(name, err)),
         Err(_) => return Err(RelayError::Timeout(name)),
     };
-    let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
     timeout(
         HANDSHAKE_TIMEOUT,
@@ -123,12 +297,7 @@ pub async fn relay(
     )
     .await
     .map_err(|_| RelayError::Timeout(name))??;
-    // Errors after the tunnel is up are ordinary disconnects.
-    Ok(
-        copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
-            .await
-            .unwrap_or_default(),
-    )
+    Ok(upstream)
 }
 
 /// Time to receive HTTP response headers through the proxy, including SOCKS5
@@ -396,5 +565,49 @@ mod tests {
         };
         let result = relay(redirected, &proxy, "203.0.113.10:443".parse().unwrap()).await;
         assert!(matches!(result, Err(RelayError::Connect(..))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn reset_after_successful_socks_handshake_is_not_a_successful_relay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = ProxyEndpoint {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            credentials: None,
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 10];
+            stream.read_exact(&mut request[..3]).await.unwrap();
+            stream.write_all(&[5, 0]).await.unwrap();
+            stream.read_exact(&mut request).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            // Wait for real tunnel data; this proves the client has processed
+            // the successful SOCKS reply before the peer resets the socket.
+            stream.read_exact(&mut [0u8; 1]).await.unwrap();
+            socket2::SockRef::from(&stream)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+        });
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = TcpStream::connect(local.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (redirected, _) = local.accept().await.unwrap();
+        app.write_all(b"request").await.unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            relay(redirected, &proxy, "203.0.113.10:443".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(
+            matches!(result, Err(RelayError::Transfer(_))),
+            "reset was hidden: {result:?}"
+        );
     }
 }
