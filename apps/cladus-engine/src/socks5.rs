@@ -33,6 +33,8 @@ pub enum Socks5Error {
     Malformed,
     #[error("SOCKS5 username and password must each contain 1 to 255 bytes")]
     InvalidCredentials,
+    #[error("SOCKS5 domain name must contain 1 to 255 bytes")]
+    InvalidDomain,
 }
 
 const VERSION: u8 = 5;
@@ -52,7 +54,27 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     negotiate(stream, credentials).await?;
-    request(stream, CMD_CONNECT, target).await?;
+    request(stream, CMD_CONNECT, Target::Ip(target)).await?;
+    Ok(())
+}
+
+/// Asks the server behind `stream` to resolve and connect to `host:port`
+/// using RFC 1928 ATYP=3 (DOMAINNAME). On success the stream carries the
+/// tunneled connection.
+pub async fn connect_domain<S>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+    credentials: Option<&Credentials>,
+) -> Result<(), Socks5Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if host.is_empty() || host.len() > 255 {
+        return Err(Socks5Error::InvalidDomain);
+    }
+    negotiate(stream, credentials).await?;
+    request(stream, CMD_CONNECT, Target::Domain(host, port)).await?;
     Ok(())
 }
 
@@ -71,7 +93,7 @@ where
     request(
         stream,
         CMD_UDP_ASSOCIATE,
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        Target::Ip(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
     )
     .await
 }
@@ -106,17 +128,30 @@ where
     }
 }
 
+enum Target<'a> {
+    Ip(SocketAddr),
+    Domain(&'a str, u16),
+}
+
 /// Sends a request and returns the bound address from the reply.
 async fn request<S>(
     stream: &mut S,
     command: u8,
-    address: SocketAddr,
+    target: Target<'_>,
 ) -> Result<BoundAddress, Socks5Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut request = vec![VERSION, command, 0];
-    push_address(&mut request, address);
+    match target {
+        Target::Ip(address) => push_address(&mut request, address),
+        Target::Domain(host, port) => {
+            request.push(3);
+            request.push(host.len() as u8);
+            request.extend_from_slice(host.as_bytes());
+            request.extend(port.to_be_bytes());
+        }
+    }
     stream.write_all(&request).await?;
 
     // VER REP RSV ATYP BND.ADDR BND.PORT
@@ -456,5 +491,38 @@ mod tests {
         };
         let (result, ()) = tokio::join!(connect(&mut client, target(), None), script);
         assert!(matches!(result, Err(Socks5Error::Version(4))));
+    }
+
+    #[tokio::test]
+    async fn connect_domain_sends_atyp_3_and_validates_length() {
+        let (mut client, mut server) = duplex(256);
+        let script = async {
+            expect(&mut server, &[5, 1, 0]).await;
+            server.write_all(&[5, 0]).await.unwrap();
+            let mut expected = vec![5, 1, 0, 3, 11];
+            expected.extend_from_slice(b"example.com");
+            expected.extend([0x01, 0xBB]);
+            expect(&mut server, &expected).await;
+            server
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            connect_domain(&mut client, "example.com", 443, None),
+            script
+        );
+        result.unwrap();
+
+        let (mut client, _server) = duplex(64);
+        assert!(matches!(
+            connect_domain(&mut client, "", 443, None).await,
+            Err(Socks5Error::InvalidDomain)
+        ));
+        let too_long = "a".repeat(256);
+        assert!(matches!(
+            connect_domain(&mut client, &too_long, 443, None).await,
+            Err(Socks5Error::InvalidDomain)
+        ));
     }
 }

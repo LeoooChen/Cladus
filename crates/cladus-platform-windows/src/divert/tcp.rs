@@ -271,10 +271,13 @@ fn on_connect(shared: &Shared, oracle: &dyn DecisionOracle, addr: &Address, data
         remote: Some(remote),
     });
     let decision = match verdict {
-        Verdict::Proxy { group, .. } => {
+        Verdict::Proxy { group, policy } => {
             counters.tcp_proxied.fetch_add(1, Relaxed);
             debug!(pid = data.process_id, port, %remote, %group, "proxying TCP connection");
-            Decision::Proxied { group: group.0 }
+            Decision::Proxied {
+                group: group.0,
+                policy: policy.0,
+            }
         }
         Verdict::Direct(reason) => {
             counters.tcp_direct.fetch_add(1, Relaxed);
@@ -491,6 +494,7 @@ async fn accept_loop(
             stream,
             original_dst: SocketAddr::new(taken.remote_ip, taken.remote_port),
             group: GroupId(taken.group),
+            policy: cladus_core::policy::PolicyId(taken.policy),
             lease: FlowLease::new(move || {
                 lease_trackers[family].clear_if(port, taken.word);
             }),

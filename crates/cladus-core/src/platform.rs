@@ -109,6 +109,8 @@ pub struct RedirectedTcp {
     /// Where the application was connecting to.
     pub original_dst: SocketAddr,
     pub group: GroupId,
+    /// Destination restrictions also apply to any alternate address.
+    pub policy: crate::policy::PolicyId,
     /// Keep alive for as long as the connection is relayed.
     pub lease: FlowLease,
 }

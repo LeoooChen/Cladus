@@ -51,6 +51,9 @@ unknown-git = "deny"
 [advisories]
 yanked = "deny"
 ignore = [
-    # Only in the Linux GTK stack of Tauri; the desktop app is built for Windows only.
+    # Only in the Linux GTK/D-Bus stack of Tauri; the desktop app is built for Windows only.
     { id = "RUSTSEC-2024-0370", reason = "Linux-only transitive dependency of Tauri (glib-macros)" },
+    { id = "RUSTSEC-2026-0370", reason = "Linux-only transitive dependency of tauri-plugin-single-instance (zbus -> zvariant)" },
+    { id = "RUSTSEC-2026-0371", reason = "Linux-only transitive dependency of tauri-plugin-single-instance (zbus -> zbus_names)" },
+    { id = "RUSTSEC-2026-0372", reason = "Linux-only transitive dependency of tauri-plugin-single-instance (zbus -> zvariant_derive)" },
 ]

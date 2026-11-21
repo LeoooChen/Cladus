@@ -76,6 +76,14 @@ const dnsEnabled = ref(false)
 const dnsStrict = ref(false)
 const dnsUpstream = ref('')
 const dnsSaveMessage = ref<string | null>(null)
+const sniRouting = ref(true)
+const sniRoutingSaving = ref(false)
+const sniRoutingError = ref('')
+const sniRoutingId = useId()
+const ipv6Fallback = ref(true)
+const ipv6FallbackSaving = ref(false)
+const ipv6FallbackError = ref('')
+const ipv6FallbackId = useId()
 
 // The engine service applies a new log level immediately.
 const logLevel = ref('info')
@@ -94,6 +102,8 @@ async function fetchConfig(options: { pushToEditor?: boolean } = {}) {
   try {
     const config = await getConfig()
     const json = JSON.stringify(config, null, 2)
+    sniRouting.value = config.tcp_sni_routing !== false
+    ipv6Fallback.value = config.tcp_ipv6_fallback !== false
     const dns = (config as Record<string, unknown>).dns as Record<string, unknown> | undefined
     if (dns) {
       dnsEnabled.value = !!dns.enabled
@@ -162,6 +172,38 @@ async function saveDns() {
   } catch (err) {
     dnsSaveMessage.value = err instanceof Error ? err.message : t('Save failed')
     await fetchConfig()
+  }
+}
+
+async function saveSniRouting() {
+  if (sniRoutingSaving.value) return
+  sniRoutingSaving.value = true
+  sniRoutingError.value = ''
+  try {
+    const config = await getConfig()
+    config.tcp_sni_routing = sniRouting.value
+    await updateConfig(config)
+  } catch (err) {
+    sniRoutingError.value = err instanceof Error ? err.message : t('Save failed')
+  } finally {
+    await fetchConfig()
+    sniRoutingSaving.value = false
+  }
+}
+
+async function saveIpv6Fallback() {
+  if (ipv6FallbackSaving.value) return
+  ipv6FallbackSaving.value = true
+  ipv6FallbackError.value = ''
+  try {
+    const config = await getConfig()
+    config.tcp_ipv6_fallback = ipv6Fallback.value
+    await updateConfig(config)
+  } catch (err) {
+    ipv6FallbackError.value = err instanceof Error ? err.message : t('Save failed')
+  } finally {
+    await fetchConfig()
+    ipv6FallbackSaving.value = false
   }
 }
 
@@ -389,7 +431,23 @@ onUnmounted(() => {
             <p v-if="autostartMessage" class="mt-2 text-xs text-red-500">{{ autostartMessage }}</p>
           </div>
 
-          <!-- DNS Proxy -->
+          <!-- TLS SNI Routing & IPv6 Fallback & DNS Proxy -->
+          <div class="px-4 py-3 bg-white dark:bg-[#18181b]">
+            <div class="flex items-center gap-3">
+              <input :id="sniRoutingId" v-model="sniRouting" type="checkbox" :disabled="sniRoutingSaving" @change="saveSniRouting" class="h-4 w-4 shrink-0" />
+              <Label :for="sniRoutingId">{{ t('TLS SNI domain routing') }}</Label>
+            </div>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ t('Send the TLS hostname to the SOCKS5 proxy on port 443 so the proxy resolves it remotely, avoiding local DNS poisoning without changing system DNS.') }}</p>
+            <p v-if="sniRoutingError" role="alert" class="text-xs text-red-500 mt-1">{{ sniRoutingError }}</p>
+          </div>
+          <div class="px-4 py-3 bg-white dark:bg-[#18181b]">
+            <div class="flex items-center gap-3">
+              <input :id="ipv6FallbackId" v-model="ipv6Fallback" type="checkbox" :disabled="ipv6FallbackSaving" @change="saveIpv6Fallback" class="h-4 w-4 shrink-0" />
+              <Label :for="ipv6FallbackId">{{ t('IPv6 connection fallback') }}</Label>
+            </div>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ t('Retry failed IPv6 TLS handshakes over IPv4 when the hostname can be verified. Established streams and early data are never replayed.') }}</p>
+            <p v-if="ipv6FallbackError" role="alert" class="text-xs text-red-500 mt-1">{{ ipv6FallbackError }}</p>
+          </div>
           <div class="px-4 py-3 bg-white dark:bg-[#18181b]">
             <div class="flex items-center justify-between">
               <div>

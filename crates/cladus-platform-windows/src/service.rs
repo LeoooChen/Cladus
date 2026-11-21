@@ -122,14 +122,80 @@ pub fn start() -> Result<(), PlatformError> {
 }
 
 pub fn stop() -> Result<(), PlatformError> {
-    let Some(service) = open_optional(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)? else {
+    let Some(service) = open_optional(
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    )?
+    else {
         return Ok(());
     };
-    if service.query_status().map_err(error)?.current_state == ServiceState::Stopped {
-        return Ok(());
+    let windivert_dir = service
+        .query_config()
+        .ok()
+        .and_then(|c| registered_arg(c.executable_path.as_os_str(), "--windivert-dir").ok());
+    if service.query_status().map_err(error)?.current_state != ServiceState::Stopped {
+        service.stop().map_err(error)?;
+        wait_for(&service, ServiceState::Stopped)?;
     }
-    service.stop().map_err(error)?;
-    wait_for(&service, ServiceState::Stopped)
+    if let Some(dir) = windivert_dir {
+        stop_owned_windivert(&dir);
+    }
+    Ok(())
+}
+
+/// Unload the `WinDivert` kernel driver service when it was loaded from
+/// Cladus's own installation directory. This releases the file lock on
+/// `WinDivert64.sys` during upgrades and uninstalls so Inno Setup does not
+/// have to schedule a reboot. Best-effort: never touches a driver owned by
+/// another installation, and ignores stop failures if another process still
+/// holds a WinDivert handle.
+fn stop_owned_windivert(windivert_dir: &Path) {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    else {
+        return;
+    };
+    let access = ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::STOP;
+    let Ok(driver) = manager.open_service("WinDivert", access) else {
+        return;
+    };
+    let Ok(config) = driver.query_config() else {
+        return;
+    };
+    if !windivert_driver_matches(&config.executable_path, windivert_dir) {
+        return;
+    }
+    let Ok(status) = driver.query_status() else {
+        return;
+    };
+    if status.current_state == ServiceState::Stopped {
+        return;
+    }
+    match driver.stop() {
+        Ok(_) => {
+            if let Err(err) =
+                wait_for_timeout(&driver, ServiceState::Stopped, Duration::from_secs(5))
+            {
+                tracing::debug!(%err, "WinDivert driver did not stop within timeout");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                "WinDivert driver could not be stopped; another handle may be open"
+            );
+        }
+    }
+}
+
+fn windivert_driver_matches(driver_path: &Path, windivert_dir: &Path) -> bool {
+    let normalize = |p: &Path| {
+        let s = p.to_string_lossy();
+        let trimmed = s
+            .strip_prefix(r"\??\")
+            .or_else(|| s.strip_prefix(r"\\?\"))
+            .unwrap_or(&s);
+        trimmed.replace('/', r"\").to_ascii_lowercase()
+    };
+    normalize(driver_path) == normalize(&windivert_dir.join("WinDivert64.sys"))
 }
 
 /// Delete only after the caller has restored DNS successfully.
@@ -159,6 +225,10 @@ pub fn installed_data_dir() -> Result<Option<PathBuf>, PlatformError> {
 }
 
 fn registered_data_dir(command: &OsStr) -> Result<PathBuf, PlatformError> {
+    registered_arg(command, "--data-dir")
+}
+
+fn registered_arg(command: &OsStr, flag: &str) -> Result<PathBuf, PlatformError> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
     let mut count = 0;
@@ -187,11 +257,13 @@ fn registered_data_dir(command: &OsStr) -> Result<PathBuf, PlatformError> {
     unsafe { LocalFree(raw.cast()) };
     let path = arguments
         .windows(2)
-        .find(|pair| pair[0] == "--data-dir")
+        .find(|pair| pair[0] == flag)
         .map(|pair| PathBuf::from(&pair[1]))
-        .ok_or_else(|| error("registered service has no data directory"))?;
+        .ok_or_else(|| error(format!("registered service has no {flag} argument")))?;
     if !path.is_absolute() {
-        return Err(error("registered service data directory must be absolute"));
+        return Err(error(format!(
+            "registered service {flag} path must be absolute"
+        )));
     }
     Ok(path)
 }
@@ -206,7 +278,15 @@ pub fn process_id() -> Result<u32, PlatformError> {
 }
 
 fn wait_for(service: &Service, expected: ServiceState) -> Result<(), PlatformError> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_for_timeout(service, expected, Duration::from_secs(30))
+}
+
+fn wait_for_timeout(
+    service: &Service,
+    expected: ServiceState,
+    limit: Duration,
+) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + limit;
     loop {
         let status = service.query_status().map_err(error)?;
         if status.current_state == expected {
@@ -286,10 +366,31 @@ mod tests {
             registered_data_dir(command).unwrap(),
             PathBuf::from(r"C:\ProgramData\Cladus test")
         );
+        assert_eq!(
+            registered_arg(command, "--windivert-dir").unwrap(),
+            PathBuf::from(r"C:\Program Files\Cladus")
+        );
         assert!(registered_data_dir(OsStr::new("cladus-engine.exe service")).is_err());
         assert!(
             registered_data_dir(OsStr::new("cladus-engine.exe service --data-dir relative"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn windivert_driver_matches_only_own_installation() {
+        let dir = Path::new(r"D:\Program Files\Cladus");
+        assert!(windivert_driver_matches(
+            Path::new(r"\??\D:\Program Files\Cladus\WinDivert64.sys"),
+            dir
+        ));
+        assert!(windivert_driver_matches(
+            Path::new(r"\\?\d:\program files\cladus\windivert64.sys"),
+            dir
+        ));
+        assert!(!windivert_driver_matches(
+            Path::new(r"\??\C:\OtherTool\WinDivert64.sys"),
+            dir
+        ));
     }
 }

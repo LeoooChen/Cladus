@@ -1,5 +1,29 @@
 # Cladus verification status
 
+## Windows 0.1.4 — 2026-11-11
+
+- Added bounded IPv6 TLS handshake fallback with DNS identity verification and
+  preservation of each flow's destination policy. Established streams are never
+  replayed. The original transfer error is retained and fallback is observable.
+- Rust workspace: 140 passed, one existing opt-in network test ignored.
+- Frontend production build and 36 Playwright checks passed at four display
+  scales. Clippy with denied warnings, formatting and layering checks passed.
+- DOMPurify, source-map-js and Vite received compatible security patch updates;
+  npm audit reports zero vulnerabilities. Frontend checks passed again afterward.
+- Isolated live TLS probe returned HTTP 200 on a healthy IPv6 path without
+  fallback. A test-owned IPv6 EOF shim followed by the real IPv4 upstream also
+  returned HTTP 200, with one recorded fallback and no failure.
+- No active-service restart or destructive service/installer tests were used for
+  these checks. This does not establish that all remote API stream resets are
+  fixed. See [the detailed report](diagnostics/2026-11-11-fallback.md).
+- Final installer: `target/installer/cladus-0.1.4-windows-x64-setup.exe`,
+  7,648,651 bytes. SHA-256:
+  `3a4cea3186b4405cde797106a6e5a3313893f0fc1a03a4a1cf35f302d6987856`.
+  Checksum verified. The active installation remains 0.1.3 pending a service
+  restart; the separate Magpie process rule has already been applied live.
+
+## Previous release verification
+
 Updated 2026-09-28 for Windows 0.1.3. Linux/macOS implementation remains deferred.
 
 ## Product identity

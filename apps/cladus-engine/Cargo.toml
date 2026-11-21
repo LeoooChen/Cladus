@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 cladus-platform-windows.workspace = true
 
 [dev-dependencies]
+socket2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 
 [lints]

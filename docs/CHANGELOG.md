@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.1.5 — 2026-11-21
+
+- Add TLS SNI domain routing (`tcp_sni_routing`, enabled by default and
+  configurable in Settings) for port 443 connections. Extracts the plaintext
+  ClientHello SNI hostname before opening the upstream tunnel and connects via
+  SOCKS5 domain addressing (`ATYP=3`), allowing the proxy to resolve targets
+  remotely and avoiding local DNS poisoning without modifying system DNS.
+- Skip SNI domain routing for non-TLS traffic, single-label or local hostnames
+  (`.local`, `.localhost`, `.lan`, `.home.arpa`, `.internal`, `.localdomain`),
+  and rules with custom CIDR destination filters. Allow Chromium/Electron GREASE
+  ECH (`0xfe0d`) ClientHellos to use their plaintext SNI for single-shot domain
+  routing.
+- Automatically fall back to IP-based SOCKS5 forwarding (and IPv6 fallback when
+  enabled) if an upstream proxy refuses `ATYP=3` (`address type not supported`).
+- Track `relay.sni_routed` and `relay.sni_fallback_to_ip` engine counters.
+- Unload Cladus's own `WinDivert` kernel driver service during `cladus-engine
+  stop` / uninstall and compare `WinDivert64.sys` by version in the installer
+  so upgrades and uninstalls no longer leave the driver locked or prompt for a
+  reboot. Also allow leftover Inno Setup `is-XXXXX.tmp` staging files when
+  upgrading from earlier releases after a deferred reboot.
+
+## 0.1.4 — 2026-11-11
+
+- Add bounded IPv6-to-IPv4 fallback for TLS connections on port 443, enabled by
+  default and configurable in Settings or `tcp_ipv6_fallback`. Only an intact
+  ClientHello without early data/ECH can be retried, before any server response.
+- Verify the original IPv6 address and candidate IPv4 addresses against the
+  ClientHello hostname using DNS over the same SOCKS5 proxy. Preserve each
+  connection's destination policy when considering an alternate address.
+- Keep healthy IPv6 connections, system DNS answers and established streams
+  unchanged. Log the original failure and track fallback attempts, selections
+  and failures. Do not retry mid-stream POSTs or replay application data.
+- Update DOMPurify to 3.4.17, source-map-js to 1.2.2 and Vite to 7.3.8 to resolve
+  the existing frontend dependency advisories. No other npm packages changed.
+
+- Preserve TCP tunnel read/write errors after SOCKS5 negotiation. Previously,
+  connection resets were converted to a successful `(0, 0)` result, omitted
+  from `relay.failed` and logged as a finished relay. Clean EOF and half-close
+  remain normal completion. This improves error reporting; it does not restore
+  connectivity on an upstream proxy with a failing IPv6 path.
+
 ## 0.1.3 — 2026-09-28
 
 - Name the product Cladus throughout the workspace, crates, executable names,

@@ -163,6 +163,8 @@ impl DecisionOracle for Core {
 pub struct Engine {
     core: Arc<Core>,
     groups: Arc<RwLock<Arc<Groups>>>,
+    sni_routing: Arc<AtomicBool>,
+    fallback_resolver: Arc<RwLock<Option<SocketAddr>>>,
     processes: Arc<dyn ProcessSource>,
     interceptor: Box<dyn TrafficInterceptor>,
     relays: Arc<RelayCounters>,
@@ -194,12 +196,19 @@ impl Engine {
         });
         let groups = Arc::new(RwLock::new(groups_of(config)));
         let relays = Arc::new(RelayCounters::default());
+        let sni_routing = Arc::new(AtomicBool::new(config.tcp_sni_routing));
+        let fallback_resolver = Arc::new(RwLock::new(
+            config.tcp_ipv6_fallback.then_some(config.dns.upstream),
+        ));
         let udp = Arc::new(UdpCounters::default());
         // The UDP relay needs the injector that starting interception returns;
         // datagrams arriving before that are dropped.
         let udp_relay: Arc<OnceLock<Arc<UdpRelay>>> = Arc::default();
         let handoff = Handoff {
             tcp: {
+                let sni_routing = Arc::clone(&sni_routing);
+                let fallback_resolver = Arc::clone(&fallback_resolver);
+                let core = Arc::clone(&core);
                 let (runtime, groups, relays) = (
                     runtime.handle().clone(),
                     Arc::clone(&groups),
@@ -207,7 +216,15 @@ impl Engine {
                 );
                 Arc::new(move |redirected: RedirectedTcp| {
                     let proxy = groups.read().unwrap().get(&redirected.group).cloned();
-                    spawn_relay(&runtime, proxy, &relays, redirected);
+                    spawn_relay(
+                        &runtime,
+                        proxy,
+                        &relays,
+                        redirected,
+                        Arc::clone(&core),
+                        sni_routing.load(Relaxed),
+                        *fallback_resolver.read().unwrap(),
+                    );
                 })
             },
             udp: {
@@ -224,6 +241,8 @@ impl Engine {
         let mut engine = Self {
             core,
             groups,
+            sni_routing,
+            fallback_resolver,
             processes: platform.processes,
             interceptor: platform.interceptor,
             relays,
@@ -292,6 +311,9 @@ impl Engine {
         core.reconfigure(config, self.core.inspector.as_ref());
         *self.core.policies.write().unwrap() = core.policies();
         *self.groups.write().unwrap() = groups_of(config);
+        self.sni_routing.store(config.tcp_sni_routing, Relaxed);
+        *self.fallback_resolver.write().unwrap() =
+            config.tcp_ipv6_fallback.then_some(config.dns.upstream);
         drop(core);
         self.interceptor.refresh_assignments();
         Ok(())
@@ -470,12 +492,16 @@ fn spawn_relay(
     proxy: Option<Arc<ProxyEndpoint>>,
     counters: &Arc<RelayCounters>,
     redirected: RedirectedTcp,
+    core: Arc<Core>,
+    sni_routing: bool,
+    fallback_resolver: Option<SocketAddr>,
 ) {
     let Some(proxy) = proxy else {
         warn!(group = %redirected.group, "no such proxy group; closing the connection");
         return;
     };
     let counters = Arc::clone(counters);
+    let original_policies = core.policies.read().unwrap().clone();
     counters.started.fetch_add(1, Relaxed);
     counters.active.fetch_add(1, Relaxed);
     let active = ActiveRelay(Arc::clone(&counters));
@@ -484,13 +510,35 @@ fn spawn_relay(
         let RedirectedTcp {
             stream,
             original_dst,
+            policy,
             lease,
             ..
         } = redirected;
         let result = async {
             stream.set_nonblocking(true)?;
             let client = tokio::net::TcpStream::from_std(stream)?;
-            Ok::<_, anyhow::Error>(relay::relay(client, &proxy, original_dst).await?)
+            let allows = |dst| {
+                original_policies.check(policy, dst).is_ok()
+                    && core.allows_destination(policy, dst)
+            };
+            let sni_allowed = sni_routing
+                && original_policies.allows_domain_routing(policy)
+                && core.policies.read().unwrap().allows_domain_routing(policy);
+            let fallback = fallback_resolver.map(|resolver| relay::Ipv6Fallback {
+                resolver,
+                allows: &allows,
+                counters: &counters,
+            });
+            let result = relay::relay_with_sni(
+                client,
+                &proxy,
+                original_dst,
+                sni_allowed,
+                fallback,
+                &counters,
+            )
+            .await;
+            Ok::<_, anyhow::Error>(result?)
         }
         .await;
         match result {

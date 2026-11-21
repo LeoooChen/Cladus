@@ -316,7 +316,10 @@ mod tests {
         let parker = Parker::new(4, i64::MAX);
         let (generation, index) = parker.park(&[0xAB], &syn_addr(20), 0, 5000).unwrap();
         assert!(tracker.try_park(5000, Word::EMPTY, generation, index, 20));
-        let decision = Decision::Proxied { group: 1 };
+        let decision = Decision::Proxied {
+            group: 1,
+            policy: 0,
+        };
         let Publish::Released(word) = tracker.publish(5000, decision, IP, 443, 10) else {
             panic!("expected release");
         };
@@ -346,7 +349,16 @@ mod tests {
         assert_eq!(tracker.state(5000), SlotState::Abandoned);
         assert_eq!(parker.released_by_watchdog.load(Relaxed), 1);
         // The decision for that flow arrives too late and is rejected.
-        let late = tracker.publish(5000, Decision::Proxied { group: 1 }, IP, 443, 10);
+        let late = tracker.publish(
+            5000,
+            Decision::Proxied {
+                group: 1,
+                policy: 0,
+            },
+            IP,
+            443,
+            10,
+        );
         assert_eq!(late, Publish::LateRejected);
     }
 }
