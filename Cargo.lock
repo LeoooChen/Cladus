@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "cladus-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ipnet",
  "serde",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "cladus-e2e"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "cladus-core",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "cladus-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "cladus-core",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "cladus-gui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cladus-core",
  "cladus-ipc",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "cladus-ipc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cladus-core",
  "serde",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "cladus-platform-windows"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arc-swap",
  "cladus-core",

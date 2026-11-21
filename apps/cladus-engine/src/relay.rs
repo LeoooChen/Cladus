@@ -21,6 +21,9 @@ const BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(test)]
 #[path = "relay_fallback_tests.rs"]
 mod fallback_tests;
+#[cfg(test)]
+#[path = "relay_sni_tests.rs"]
+mod sni_tests;
 
 /// SOCKS5 reachability/authentication only, without contacting a website.
 pub async fn check_proxy(proxy: &ProxyEndpoint) -> Result<(), String> {
@@ -80,6 +83,8 @@ pub struct RelayCounters {
     pub ipv4_fallback_attempted: AtomicU64,
     pub ipv4_fallback_selected: AtomicU64,
     pub ipv4_fallback_failed: AtomicU64,
+    pub sni_routed: AtomicU64,
+    pub sni_fallback_to_ip: AtomicU64,
 }
 
 impl RelayCounters {
@@ -117,6 +122,14 @@ impl RelayCounters {
                 name: "relay.ipv4_fallback_failed",
                 value: self.ipv4_fallback_failed.load(Relaxed),
             },
+            Counter {
+                name: "relay.sni_routed",
+                value: self.sni_routed.load(Relaxed),
+            },
+            Counter {
+                name: "relay.sni_fallback_to_ip",
+                value: self.sni_fallback_to_ip.load(Relaxed),
+            },
         ]
     }
 }
@@ -143,6 +156,64 @@ pub struct Ipv6Fallback<'a> {
     pub counters: &'a RelayCounters,
 }
 
+/// Relays a redirected TCP stream, optionally inspecting plaintext TLS SNI on
+/// port 443 and connecting through SOCKS5 by hostname (`ATYP=3`) so the proxy
+/// resolves the destination remotely.
+pub async fn relay_with_sni(
+    mut client: TcpStream,
+    proxy: &ProxyEndpoint,
+    target: SocketAddr,
+    sni_allowed: bool,
+    fallback: Option<Ipv6Fallback<'_>>,
+    counters: &RelayCounters,
+) -> Result<(u64, u64), RelayError> {
+    if !sni_allowed || target.port() != 443 {
+        return match fallback {
+            Some(fb) => relay_with_fallback(client, proxy, target, fb).await,
+            None => relay(client, proxy, target).await,
+        };
+    }
+    let _ = client.set_nodelay(true);
+    let (hello, hostname) = read_client_hello_with(&mut client, tls_hello::inspect_sni).await?;
+    if let Some(hostname) = hostname {
+        match open_domain_tunnel(proxy, &hostname, target.port()).await {
+            Ok(upstream) => {
+                counters.sni_routed.fetch_add(1, Relaxed);
+                return finish_buffered(client, upstream, &hello).await;
+            }
+            Err(RelayError::Socks5(Socks5Error::Refused("address type not supported"))) => {
+                counters.sni_fallback_to_ip.fetch_add(1, Relaxed);
+                tracing::debug!(
+                    %target,
+                    %hostname,
+                    "SOCKS5 proxy refused domain target; falling back to IP"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if let Some(fb) = fallback
+        && let std::net::IpAddr::V6(original_ip) = target.ip()
+        && original_ip.to_ipv4_mapped().is_none()
+        && let tls_hello::Hello::Retryable(host) = tls_hello::inspect(&hello)
+    {
+        let original = open_tunnel(proxy, target).await;
+        return finish_with_ipv6_fallback(
+            client,
+            proxy,
+            target,
+            original_ip,
+            original,
+            hello,
+            host,
+            fb,
+        )
+        .await;
+    }
+    let upstream = open_tunnel(proxy, target).await?;
+    finish_buffered(client, upstream, &hello).await
+}
+
 pub async fn relay_with_fallback(
     mut client: TcpStream,
     proxy: &ProxyEndpoint,
@@ -157,19 +228,35 @@ pub async fn relay_with_fallback(
     }
     let _ = client.set_nodelay(true);
     let original = open_tunnel(proxy, target).await;
-    let (hello, hostname) = read_client_hello(&mut client).await?;
+    let (hello, hostname) = read_client_hello_with(&mut client, tls_hello::inspect).await?;
     let Some(hostname) = hostname else {
-        let mut upstream = original?;
-        upstream
-            .write_all(&hello)
-            .await
-            .map_err(RelayError::Transfer)?;
-        let (up, down) =
-            copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
-                .await
-                .map_err(RelayError::Transfer)?;
-        return Ok((up + hello.len() as u64, down));
+        let upstream = original?;
+        return finish_buffered(client, upstream, &hello).await;
     };
+    finish_with_ipv6_fallback(
+        client,
+        proxy,
+        target,
+        original_ip,
+        original,
+        hello,
+        hostname,
+        fallback,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_with_ipv6_fallback(
+    mut client: TcpStream,
+    proxy: &ProxyEndpoint,
+    target: SocketAddr,
+    original_ip: std::net::Ipv6Addr,
+    original: Result<TcpStream, RelayError>,
+    hello: Vec<u8>,
+    hostname: String,
+    fallback: Ipv6Fallback<'_>,
+) -> Result<(u64, u64), RelayError> {
     let first = match original {
         Ok(stream) => first_response(stream, &hello).await,
         Err(error) => Err(error),
@@ -232,13 +319,32 @@ pub async fn relay_with_fallback(
     Ok((up + hello.len() as u64, down + 1))
 }
 
-async fn read_client_hello(
+async fn finish_buffered(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    hello: &[u8],
+) -> Result<(u64, u64), RelayError> {
+    if !hello.is_empty() {
+        upstream
+            .write_all(hello)
+            .await
+            .map_err(RelayError::Transfer)?;
+    }
+    let (up, down) =
+        copy_bidirectional_with_sizes(&mut client, &mut upstream, BUFFER_SIZE, BUFFER_SIZE)
+            .await
+            .map_err(RelayError::Transfer)?;
+    Ok((up + hello.len() as u64, down))
+}
+
+async fn read_client_hello_with(
     client: &mut TcpStream,
+    inspector: fn(&[u8]) -> tls_hello::Hello,
 ) -> Result<(Vec<u8>, Option<String>), RelayError> {
     let mut bytes = Vec::new();
     let result = timeout(Duration::from_secs(1), async {
         loop {
-            match tls_hello::inspect(&bytes) {
+            match inspector(&bytes) {
                 tls_hello::Hello::Pass => return Ok::<_, RelayError>(None),
                 tls_hello::Hello::Retryable(host) => return Ok(Some(host)),
                 tls_hello::Hello::More => {}
@@ -279,8 +385,36 @@ async fn first_response(
 }
 
 async fn open_tunnel(proxy: &ProxyEndpoint, target: SocketAddr) -> Result<TcpStream, RelayError> {
+    let mut upstream = connect_proxy(proxy).await?;
     let name = format!("{}:{}", proxy.host, proxy.port);
-    let mut upstream = match timeout(
+    timeout(
+        HANDSHAKE_TIMEOUT,
+        socks5::connect(&mut upstream, target, proxy.credentials.as_ref()),
+    )
+    .await
+    .map_err(|_| RelayError::Timeout(name))??;
+    Ok(upstream)
+}
+
+async fn open_domain_tunnel(
+    proxy: &ProxyEndpoint,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, RelayError> {
+    let mut upstream = connect_proxy(proxy).await?;
+    let name = format!("{}:{}", proxy.host, proxy.port);
+    timeout(
+        HANDSHAKE_TIMEOUT,
+        socks5::connect_domain(&mut upstream, host, port, proxy.credentials.as_ref()),
+    )
+    .await
+    .map_err(|_| RelayError::Timeout(name))??;
+    Ok(upstream)
+}
+
+async fn connect_proxy(proxy: &ProxyEndpoint) -> Result<TcpStream, RelayError> {
+    let name = format!("{}:{}", proxy.host, proxy.port);
+    let upstream = match timeout(
         CONNECT_TIMEOUT,
         TcpStream::connect((proxy.host.as_str(), proxy.port)),
     )
@@ -291,12 +425,6 @@ async fn open_tunnel(proxy: &ProxyEndpoint, target: SocketAddr) -> Result<TcpStr
         Err(_) => return Err(RelayError::Timeout(name)),
     };
     let _ = upstream.set_nodelay(true);
-    timeout(
-        HANDSHAKE_TIMEOUT,
-        socks5::connect(&mut upstream, target, proxy.credentials.as_ref()),
-    )
-    .await
-    .map_err(|_| RelayError::Timeout(name))??;
     Ok(upstream)
 }
 

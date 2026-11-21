@@ -82,7 +82,8 @@ pub fn secure_install_directory(path: &Path) -> io::Result<()> {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if !matches!(
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            let allowed = matches!(
                 name.as_str(),
                 "cladus.exe"
                     | "cladus-engine.exe"
@@ -93,10 +94,8 @@ pub fn secure_install_directory(path: &Path) -> io::Result<()> {
                     | "third_party_notices.md"
                     | "unins000.exe"
                     | "unins000.dat"
-            ) || std::fs::symlink_metadata(entry.path())?.file_attributes()
-                & FILE_ATTRIBUTE_REPARSE_POINT
-                != 0
-            {
+            ) || (meta.is_file() && is_inno_restart_temp(&name));
+            if !allowed || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(io::Error::other(
                     "installation directory contains unrelated files or reparse points",
                 ));
@@ -107,6 +106,16 @@ pub fn secure_install_directory(path: &Path) -> io::Result<()> {
         path,
         "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)",
     )
+}
+
+/// Inno Setup stages `restartreplace` files (such as a busy WinDivert driver)
+/// as `is-XXXXX.tmp` until the next reboot. Allow those regular temp files so
+/// re-running the installer before rebooting does not fail.
+fn is_inno_restart_temp(lowercase_name: &str) -> bool {
+    lowercase_name
+        .strip_prefix("is-")
+        .and_then(|s| s.strip_suffix(".tmp"))
+        .is_some_and(|id| id.len() == 5 && id.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 fn secure_directory_with_acl(path: &Path, sddl: &str) -> io::Result<()> {
@@ -275,5 +284,20 @@ pub(crate) fn authorize_client(pipe: &NamedPipeServer) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "only local administrators may control Cladus",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_inno_restart_temp_names_only() {
+        assert!(is_inno_restart_temp("is-5o9hi.tmp"));
+        assert!(is_inno_restart_temp("is-abc12.tmp"));
+        assert!(!is_inno_restart_temp("is-toolong.tmp"));
+        assert!(!is_inno_restart_temp("is-1234.tmp"));
+        assert!(!is_inno_restart_temp("is-12345.exe"));
+        assert!(!is_inno_restart_temp("other.tmp"));
     }
 }

@@ -8,7 +8,7 @@ Windows per-process TCP/UDP proxying in Rust, without TUN or DLL injection.
 Rules follow a process's descendants, including children that outlive their
 launcher. WinDivert redirects traffic to a SOCKS5 server.
 
-Windows 0.1.4 includes the service, desktop GUI, DNS forwarding, configuration import
+Windows 0.1.5 includes the service, desktop GUI, DNS forwarding, configuration import
 and installer. See [verification status](docs/STATUS.md) for tested behavior
 and remaining release checks. Linux/macOS backends are deferred; portable
 logic remains separated in `cladus-core`.
@@ -16,7 +16,7 @@ logic remains separated in `cladus-core`.
 ## Install and use
 
 Requires Windows 10 2004 (build 19041) or newer, x64. Run
-`cladus-0.1.4-windows-x64-setup.exe` as administrator. Setup installs WebView2
+`cladus-0.1.5-windows-x64-setup.exe` as administrator. Setup installs WebView2
 if missing (Internet access needed), registers the Cladus Engine service and
 starts it **idle**. Subsequent GUI launches do not need elevation for Windows
 administrators using their normal UAC token. Standard users who are not members
@@ -223,11 +223,11 @@ directory. The design and future scope are in [docs/DESIGN.md](docs/DESIGN.md).
 
 Cladus 是用 Rust 开发的 Windows 按进程 TCP/UDP 代理工具，无需 TUN 或 DLL 注入。规则会跟随目标进程的子进程，即使启动器已经退出也有效；程序通过 WinDivert 将流量转发到 SOCKS5 服务器。
 
-Windows 0.1.4 包含系统服务、桌面界面、DNS 转发、配置导入和安装程序。已验证的功能及待完成的发布检查见[验证状态](docs/STATUS.md)。Linux/macOS 后端暂未实现；可移植逻辑放在 `cladus-core` 中。
+Windows 0.1.5 包含系统服务、桌面界面、DNS 转发、配置导入和安装程序。已验证的功能及待完成的发布检查见[验证状态](docs/STATUS.md)。Linux/macOS 后端暂未实现；可移植逻辑放在 `cladus-core` 中。
 
 ### 安装与使用
 
-需要 Windows 10 2004（内部版本 19041）或更新版本，x64。以管理员身份运行 `cladus-0.1.4-windows-x64-setup.exe`。安装程序会在缺少 WebView2 时安装它（需要联网），注册 Cladus Engine 服务并使其以**空闲**状态启动。此后，Windows 管理员使用普通 UAC 令牌即可启动界面，无需再次提权；非管理员标准用户无法控制引擎。
+需要 Windows 10 2004（内部版本 19041）或更新版本，x64。以管理员身份运行 `cladus-0.1.5-windows-x64-setup.exe`。安装程序会在缺少 WebView2 时安装它（需要联网），注册 Cladus Engine 服务并使其以**空闲**状态启动。此后，Windows 管理员使用普通 UAC 令牌即可启动界面，无需再次提权；非管理员标准用户无法控制引擎。
 
 代理运行期间，引擎会添加一条 Windows Defender 防火墙入站 TCP 规则，仅适用于引擎程序和临时重定向监听端口。正常停止时会删除该规则；服务崩溃后重启时会清理遗留规则。如果系统策略禁止添加该规则，TCP 拦截将无法启动。
 

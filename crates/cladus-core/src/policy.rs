@@ -43,6 +43,16 @@ impl PolicyTable {
             _ => Ok(()),
         }
     }
+
+    /// Whether a rule permits routing a connection by hostname instead of its
+    /// resolved IP address. Rules with custom IP CIDR filters keep IP routing
+    /// so remote resolution cannot bypass those filters.
+    pub fn allows_domain_routing(&self, policy: PolicyId) -> bool {
+        match self.rules.get(&policy) {
+            Some(filter) => filter.include_cidrs.is_empty() && filter.exclude_cidrs.is_empty(),
+            None => true,
+        }
+    }
 }
 
 /// Destinations that can never be reached through a proxy.
@@ -117,5 +127,25 @@ mod tests {
         assert_eq!(check(0, "203.0.113.5:80"), Ok(()));
         // A policy whose rule is gone keeps only the global exclusions.
         assert_eq!(check(9, "203.0.113.5:80"), Ok(()));
+    }
+
+    #[test]
+    fn domain_routing_is_disabled_when_rule_filters_cidrs() {
+        let with_cidr = table();
+        assert!(!with_cidr.allows_domain_routing(PolicyId(1)));
+        assert!(with_cidr.allows_domain_routing(GLOBAL_POLICY));
+        assert!(with_cidr.allows_domain_routing(PolicyId(9)));
+
+        let port_only = PolicyTable::new(
+            Vec::new(),
+            HashMap::from([(
+                PolicyId(2),
+                DestinationFilter {
+                    include_ports: vec!["443".parse().unwrap()],
+                    ..DestinationFilter::default()
+                },
+            )]),
+        );
+        assert!(port_only.allows_domain_routing(PolicyId(2)));
     }
 }

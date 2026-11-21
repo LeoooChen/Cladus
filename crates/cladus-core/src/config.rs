@@ -23,6 +23,10 @@ pub struct Config {
     /// Destinations that are never proxied, whatever the rules say.
     pub global_exclude_cidrs: Vec<Cidr>,
     pub tcp_syn_parking: SynParking,
+    /// Extract the plaintext TLS SNI hostname on port 443 and send it to the
+    /// SOCKS5 proxy (ATYP=3) so the proxy resolves it remotely, avoiding local
+    /// DNS poisoning without overriding system DNS.
+    pub tcp_sni_routing: bool,
     /// Retry an IPv6 TLS connection over IPv4 only before any server response
     /// or application data. Requires a DNS-verified hostname from ClientHello.
     pub tcp_ipv6_fallback: bool,
@@ -48,6 +52,7 @@ impl Default for Config {
                 .map(|s| s.parse().expect("built-in CIDR is valid"))
                 .collect(),
             tcp_syn_parking: SynParking::default(),
+            tcp_sni_routing: true,
             tcp_ipv6_fallback: true,
             dns: DnsConfig::default(),
             log_level: LogLevel::default(),
@@ -459,6 +464,12 @@ mod tests {
         assert_eq!(rule.protocol, RuleProtocol::Both);
         assert_eq!(rule.proxy_group_id, GroupId(0));
         assert_eq!(config.proxy_groups, vec![ProxyGroup::default()]);
+        assert!(config.tcp_sni_routing);
+        assert!(
+            !Config::from_json(r#"{"tcp_sni_routing": false}"#)
+                .unwrap()
+                .tcp_sni_routing
+        );
         assert!(config.tcp_ipv6_fallback);
         assert!(
             !Config::from_json(r#"{"tcp_ipv6_fallback": false}"#)

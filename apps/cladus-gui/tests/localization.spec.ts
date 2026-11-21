@@ -4,7 +4,7 @@ import { test, expect, type Page } from '@playwright/test'
 // the test process, so it survives page reloads.
 async function mockBackend(page: Page, language = 'system', failSave = false, connections: unknown[] = [], checkProxy?: () => Promise<{ reachable: boolean; error?: string }>) {
   const prefs = { language, close_to_tray: false, start_minimized: false }
-  const config = { version: 1, proxy_groups: [], rules: [], tcp_ipv6_fallback: true, log_level: 'info', dns: { enabled: false, upstream: '8.8.8.8:53', strict: false } }
+  const config = { version: 1, proxy_groups: [], rules: [], tcp_sni_routing: true, tcp_ipv6_fallback: true, log_level: 'info', dns: { enabled: false, upstream: '8.8.8.8:53', strict: false } }
   const groups = [{ id: 0, name: 'default', host: '127.0.0.1', port: 7890, type: 'socks5', test_url: 'https://example.com' }]
   await page.exposeFunction('__mockInvoke', (cmd: string, args: Record<string, unknown>) => {
     switch (cmd) {
@@ -57,6 +57,23 @@ async function settings(page: Page, label = '设置') {
   await page.getByRole('button', { name: label, exact: true }).click()
   await expect(page.getByLabel(label === 'Settings' ? 'Language' : '语言', { exact: true })).toBeVisible()
 }
+
+test('TLS SNI routing can be disabled, persisted and enabled without touching DNS', async ({ page }) => {
+  await mockBackend(page)
+  await page.goto('/')
+  await settings(page)
+  const sni = page.getByLabel('TLS SNI 域名转发', { exact: true })
+  await expect(sni).toBeChecked()
+  await sni.uncheck()
+  await expect(sni).toBeEnabled()
+  await expect(sni).not.toBeChecked()
+  await page.reload()
+  await settings(page)
+  await expect(sni).not.toBeChecked()
+  await sni.check()
+  await expect(sni).toBeEnabled()
+  await expect(sni).toBeChecked()
+})
 
 test('IPv6 fallback can be disabled, persisted and enabled without touching DNS', async ({ page }) => {
   await mockBackend(page)

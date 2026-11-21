@@ -50,7 +50,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#Bin}\cladus.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Bin}\cladus-engine.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\third_party\windivert\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#Root}\third_party\windivert\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+Source: "{#Root}\third_party\windivert\WinDivert64.sys"; DestDir: "{app}"; Flags: restartreplace uninsrestartdelete
 Source: "{#Root}\third_party\windivert\LICENSE"; DestDir: "{app}\licenses"; DestName: "WinDivert.txt"; Flags: ignoreversion
 Source: "{#Root}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion

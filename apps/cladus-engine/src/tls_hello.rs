@@ -10,6 +10,23 @@ pub(crate) enum Hello {
 }
 
 pub(crate) fn inspect(bytes: &[u8]) -> Hello {
+    inspect_with(bytes, false)
+}
+
+/// Inspect a plaintext TLS ClientHello for single-shot SNI domain routing
+/// before any upstream tunnel is opened. Because nothing is ever replayed,
+/// TLS 1.3 early-data, coalesced bytes, and ECH / GREASE-ECH (`0xfe0d`, sent
+/// by Chromium-based apps on every TLS 1.3 handshake) are allowed; local and
+/// single-label names still pass through to IP routing.
+pub(crate) fn inspect_sni(bytes: &[u8]) -> Hello {
+    match inspect_with(bytes, true) {
+        Hello::Retryable(host) if is_routable_domain(&host) => Hello::Retryable(host),
+        Hello::Retryable(_) => Hello::Pass,
+        other => other,
+    }
+}
+
+fn inspect_with(bytes: &[u8], single_shot: bool) -> Hello {
     if bytes.len() > MAX_HELLO {
         return Hello::Pass;
     }
@@ -43,11 +60,14 @@ pub(crate) fn inspect(bytes: &[u8]) -> Hello {
                 return Hello::Pass;
             }
             if handshake.len() >= wanted {
-                // Never replay coalesced handshake/application/early data.
-                if handshake.len() != wanted || at != bytes.len() {
-                    return Hello::Pass;
+                if !single_shot {
+                    // Never replay coalesced handshake/application/early data.
+                    if handshake.len() != wanted || at != bytes.len() {
+                        return Hello::Pass;
+                    }
                 }
-                return hostname(&handshake[4..]).map_or(Hello::Pass, Hello::Retryable);
+                return hostname(&handshake[4..wanted], single_shot)
+                    .map_or(Hello::Pass, Hello::Retryable);
             }
         }
         if at == bytes.len() {
@@ -72,7 +92,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn hostname(body: &[u8]) -> Option<String> {
+fn hostname(body: &[u8], allow_early_data: bool) -> Option<String> {
     let mut r = Reader(body);
     r.take(34)?; // legacy version and random
     let session = r.byte()?;
@@ -100,8 +120,13 @@ fn hostname(body: &[u8]) -> Option<String> {
         let kind = extensions.word()?;
         let len = extensions.word()?;
         let value = extensions.take(len)?;
-        // TLS 1.3 early data can contain a POST. ECH hides the actual hostname.
-        if kind == 42 || kind == 0xfe0d {
+        // For IPv6 fallback (retryable), reject TLS 1.3 early data (may carry a
+        // POST) and ECH (outer SNI may not match the inner target's AAAA).
+        // For single-shot SNI routing, nothing is replayed, and modern browsers
+        // (Chromium/Electron) send GREASE ECH (0xfe0d) alongside the real SNI
+        // (or the real ECH frontend public_name), both of which are valid
+        // SOCKS5 domain targets.
+        if !allow_early_data && (kind == 42 || kind == 0xfe0d) {
             return None;
         }
         if kind == 0 {
@@ -137,6 +162,18 @@ pub(crate) fn valid_hostname(host: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
+}
+
+pub(crate) fn is_routable_domain(host: &str) -> bool {
+    const LOCAL_SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".lan",
+        ".home.arpa",
+        ".internal",
+        ".localdomain",
+    ];
+    host.contains('.') && !LOCAL_SUFFIXES.iter().any(|s| host.ends_with(s))
 }
 
 #[cfg(test)]
@@ -184,5 +221,40 @@ pub(crate) mod tests {
         split.extend(&h[12..]);
         assert_eq!(inspect(&split), Hello::Retryable("chatgpt.com".into()));
         assert_eq!(inspect(&hello("bad.example/other", &[])), Hello::Pass);
+    }
+
+    #[test]
+    fn inspect_sni_allows_single_shot_early_data_and_filters_local_names() {
+        let h = hello("api.example.com", &[0, 42, 0, 0]);
+        assert_eq!(inspect_sni(&h), Hello::Retryable("api.example.com".into()));
+        let mut coalesced = h.clone();
+        coalesced.extend(b"trailing");
+        assert_eq!(
+            inspect_sni(&coalesced),
+            Hello::Retryable("api.example.com".into())
+        );
+        // GREASE ECH / ECH (0xfe0d) keeps its plaintext SNI for single-shot
+        // domain routing (Chromium/Electron send GREASE ECH on every TLS 1.3
+        // handshake), while retryable `inspect` still rejects it.
+        assert_eq!(
+            inspect_sni(&hello("api.example.com", &[0xfe, 0x0d, 0, 0])),
+            Hello::Retryable("api.example.com".into())
+        );
+        assert_eq!(
+            inspect(&hello("api.example.com", &[0xfe, 0x0d, 0, 0])),
+            Hello::Pass
+        );
+        // Local and single-label names stay on IP routing.
+        for local in [
+            "localhost",
+            "intranet",
+            "printer.local",
+            "app.localhost",
+            "router.lan",
+            "nas.home.arpa",
+            "svc.internal",
+        ] {
+            assert_eq!(inspect_sni(&hello(local, &[])), Hello::Pass, "{local}");
+        }
     }
 }
